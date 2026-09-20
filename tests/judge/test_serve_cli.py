@@ -17,6 +17,9 @@ from vlc_ua.judge.serve import serve
 from vlc_ua.judge import cli
 
 
+REPO_ROOT = str(Path(__file__).resolve().parents[2])
+
+
 def find_free_port():
     """Find a free port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -157,7 +160,7 @@ class TestCLITask:
             [sys.executable, "-m", "vlc_ua.judge.cli", "task", "attribution"],
             capture_output=True,
             text=True,
-            cwd="/home/user/vlc-ua"
+            cwd=REPO_ROOT
         )
 
         assert result.returncode == 0
@@ -171,7 +174,7 @@ class TestCLITask:
             [sys.executable, "-m", "vlc_ua.judge.cli", "task", "departure_pair"],
             capture_output=True,
             text=True,
-            cwd="/home/user/vlc-ua"
+            cwd=REPO_ROOT
         )
 
         assert result.returncode == 0
@@ -204,7 +207,7 @@ class TestCLIGoldAttribution:
              "--out", str(out_file), "--per-doc", "2"],
             capture_output=True,
             text=True,
-            cwd="/home/user/vlc-ua"
+            cwd=REPO_ROOT
         )
 
         assert result.returncode == 0
@@ -255,7 +258,7 @@ class TestCLIRun:
              "--out", str(out_file)],
             capture_output=True,
             text=True,
-            cwd="/home/user/vlc-ua"
+            cwd=REPO_ROOT
         )
 
         assert result.returncode == 0
@@ -322,7 +325,7 @@ class TestCLIReport:
              "--gold", str(gold_file)],
             capture_output=True,
             text=True,
-            cwd="/home/user/vlc-ua"
+            cwd=REPO_ROOT
         )
 
         assert result.returncode == 0
@@ -366,7 +369,7 @@ class TestCLIServe:
                  "--port", str(port)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd="/home/user/vlc-ua",
+                cwd=REPO_ROOT,
                 text=True
             )
 

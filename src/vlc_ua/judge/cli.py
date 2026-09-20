@@ -71,6 +71,8 @@ def cmd_gold_departures(args) -> None:
         rows += list(gold_dep.from_departures_table(args.positions_db, limit=args.limit))
     if args.rejects:
         rows += list(gold_dep.from_rejects_dump(args.rejects, limit=args.limit))
+    if getattr(args, "evidence", False):
+        rows = list(gold_dep.relabel_by_evidence(rows))
     n = gold_dep.write(gold_dep.merge_adjudications(rows, args.adjudication), args.out)
     print(f"{n} rows -> {args.out}")
 
@@ -146,6 +148,9 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("gold-departures")
     p.add_argument("--dep-gold"); p.add_argument("--positions-db"); p.add_argument("--rejects")
     p.add_argument("--adjudication"); p.add_argument("--limit", type=int); p.add_argument("--out", required=True)
+    p.add_argument("--evidence", action="store_true",
+                   help="label each row from the sentence itself and drop rows the sentence "
+                        "does not decide (see gold/departures.py: evidence_label)")
     p.set_defaults(fn=cmd_gold_departures)
 
     p = sub.add_parser("run"); _backend_args(p)

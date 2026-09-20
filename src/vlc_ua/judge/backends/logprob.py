@@ -21,6 +21,7 @@ import json
 import math
 import os
 import string
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -78,6 +79,7 @@ class LogprobJudge:
     system: str = ("Ти — класифікатор. Ти не пишеш пояснень, лише обираєш варіант.")
     name: str = "logprob"
     user_agent: str = "vlc-ua-judge/0.1"
+    note: str = ""   # why a call degraded, filled per request
 
     def _key(self) -> str | None:
         return self.api_key or os.environ.get(self.api_key_env)
@@ -89,8 +91,19 @@ class LogprobJudge:
             headers["Authorization"] = f"Bearer {key}"
         req = urllib.request.Request(self.base_url.rstrip("/") + "/chat/completions",
                                      data=json.dumps(body).encode("utf-8"), headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # "HTTP Error 400: Bad Request" says nothing: a wrong model name, an
+            # exhausted quota and an unsupported parameter all look the same.
+            # Carry the provider's own message into the error text.
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:400]
+            except Exception:
+                detail = ""
+            raise urllib.error.HTTPError(exc.url, exc.code, f"{exc.reason}: {detail}",
+                                         exc.headers, None) from None
 
     def letter_logprobs(self, prompt: str) -> tuple[dict[str, float], bool, str]:
         """(logprob per letter, degraded, sampled_text)."""
@@ -100,7 +113,21 @@ class LogprobJudge:
             "messages": [{"role": "system", "content": self.system},
                          {"role": "user", "content": prompt}],
         }
-        resp = self._post(body)
+        self.note = ""
+        try:
+            resp = self._post(body)
+        except urllib.error.HTTPError as exc:
+            # A provider that refuses the parameter outright (Groq 400:
+            # "`logprobs` is not supported with this model"; Cohere 422:
+            # "top_logprobs is not supported") is not a dead channel: it is a
+            # one-hot teacher. Retry without the parameter and mark it degraded,
+            # so the caller can tell "no distribution" from "no channel".
+            if exc.code in (400, 422) and "logprob" in str(exc).lower():
+                self.note = "endpoint rejects the logprobs parameter"
+                plain = {k: v for k, v in body.items() if k not in ("logprobs", "top_logprobs")}
+                resp = self._post(plain)
+            else:
+                raise
         choice = resp["choices"][0]
         text = (choice.get("message") or {}).get("content") or ""
         content = ((choice.get("logprobs") or {}).get("content")) or []
