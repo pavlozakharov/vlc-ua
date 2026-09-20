@@ -59,6 +59,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-fp16", dest="fp16", action="store_false")
     ap.add_argument("--grad-checkpointing", action="store_true",
                     help="trade ~30%% speed for memory if the batch does not fit")
+    ap.add_argument("--freeze-embeddings", action="store_true",
+                    help="do not train the embedding matrix. On XLM-R large it is 256M of "
+                         "the 559M parameters, so freezing it removes ~3.6 GB of gradients "
+                         "and AdamW state — the difference between fitting a T4 and not")
     ap.add_argument("--max-hours", type=float, default=0.0,
                     help="stop training after this many hours and still calibrate, write "
                          "head.json and export: a kernel killed at the 12h wall leaves nothing")
@@ -87,7 +91,24 @@ def main(argv: list[str] | None = None) -> None:
     model = AutoModelForSequenceClassification.from_pretrained(args.base, num_labels=1).to(device)
     if args.grad_checkpointing:
         model.gradient_checkpointing_enable()
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        model.config.use_cache = False
+    if args.freeze_embeddings:
+        emb = model.get_input_embeddings()
+        for prm in emb.parameters():
+            prm.requires_grad_(False)
+        if args.grad_checkpointing and hasattr(model, "enable_input_require_grads"):
+            # With the embedding frozen, the tensor entering the first checkpointed
+            # block carries no grad, and checkpointing then recomputes a graph that
+            # leads nowhere: the step runs and changes nothing. This hook puts
+            # requires_grad back on the embedding OUTPUT without unfreezing weights.
+            model.enable_input_require_grads()
+    trainable = [prm for prm in model.parameters() if prm.requires_grad]
+    n_all = sum(prm.numel() for prm in model.parameters())
+    n_trn = sum(prm.numel() for prm in trainable)
+    print(f"parameters: {n_all/1e6:.1f}M total, {n_trn/1e6:.1f}M trainable", flush=True)
+    if not trainable:
+        raise SystemExit("nothing left to train: check --freeze-embeddings")
+    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
     use_amp = bool(args.fp16) and device == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     print(f"device {device}, amp {use_amp}, max_length {args.max_length}, "
@@ -143,7 +164,7 @@ def main(argv: list[str] | None = None) -> None:
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             scaler.step(opt); scaler.update()
             total += float(loss); steps += 1
             if steps % 50 == 0:
@@ -188,6 +209,8 @@ def main(argv: list[str] | None = None) -> None:
          "dev_metrics": metrics, "max_length": args.max_length,
          "train": {"rows": len(train_rows), "dev_rows": len(dev_rows), "epochs": args.epochs,
                    "lr": args.lr, "batch_rows": args.batch_rows, "fp16": bool(args.fp16),
+                   "frozen_embeddings": bool(args.freeze_embeddings),
+                   "grad_checkpointing": bool(args.grad_checkpointing),
                    "hours": round((time.time() - t0) / 3600, 2),
                    "stopped_on_budget": bool(stop)}},
         ensure_ascii=False, indent=1), encoding="utf-8")

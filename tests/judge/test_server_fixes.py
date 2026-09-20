@@ -118,3 +118,52 @@ class TestLogprobFallback:
         j = self._judge(400, "model not found", {})
         with pytest.raises(urllib.error.HTTPError):
             j.raw_scores("текст", Choice(instructions="?", criteria={"a": None, "b": None}))
+
+
+class TestTrainingStepActuallyLearns:
+    """Frozen embeddings + checkpointing is the combination that silently
+    trains nothing: the step runs, the loss prints, no weight moves."""
+
+    def _tiny(self, tmp_path, **flags):
+        import json
+        import torch
+        from transformers import AutoTokenizer, XLMRobertaConfig, XLMRobertaForSequenceClassification
+        from vlc_ua.judge.train import crossencoder as ce
+
+        tok = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
+        cfg = XLMRobertaConfig(vocab_size=tok.vocab_size, hidden_size=32, num_hidden_layers=2,
+                               num_attention_heads=2, intermediate_size=64,
+                               max_position_embeddings=130, num_labels=1, type_vocab_size=1)
+        base = tmp_path / "base"
+        XLMRobertaForSequenceClassification(cfg).save_pretrained(base)
+        tok.save_pretrained(base)
+
+        task = {"attribution": {"type": "choice", "instructions": "розділ?",
+                                "criteria": {"court": "суд", "party": "сторона"}}}
+        (tmp_path / "task.json").write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+        rows = [{"id": f"r{i}", "state": {"fragment": "Верховний Суд зазначає, що " * 5},
+                 "question": "attribution", "gold": "court" if i % 2 else "party",
+                 "sample": "random"} for i in range(8)]
+        (tmp_path / "gold.jsonl").write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+
+        out = tmp_path / "head"
+        argv = ["--gold", str(tmp_path / "gold.jsonl"), "--task", str(tmp_path / "task.json"),
+                "--base", str(base), "--out", str(out), "--epochs", "1", "--batch-rows", "2",
+                "--max-length", "64", "--dev-share", "0.25", "--lr", "1e-3"]
+        for f in flags.get("flags", []):
+            argv.append(f)
+        before = {k: v.clone() for k, v in
+                  XLMRobertaForSequenceClassification.from_pretrained(base).state_dict().items()}
+        ce.main(argv)
+        after = XLMRobertaForSequenceClassification.from_pretrained(out).state_dict()
+        return before, after, torch
+
+    def test_weights_move_with_frozen_embeddings_and_checkpointing(self, tmp_path):
+        before, after, torch = self._tiny(
+            tmp_path, flags=["--freeze-embeddings", "--grad-checkpointing"])
+        moved = [k for k in after
+                 if k in before and not torch.equal(before[k].float(), after[k].float())]
+        assert moved, "no weight changed: the training step did nothing"
+        emb = [k for k in moved if "word_embeddings" in k]
+        assert not emb, f"frozen embedding moved: {emb}"

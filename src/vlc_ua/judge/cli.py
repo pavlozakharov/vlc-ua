@@ -59,7 +59,7 @@ def cmd_gold_attribution(args) -> None:
     if src.is_dir():
         docs = ((p.stem, p.read_text(encoding="utf-8", errors="replace")) for p in sorted(src.glob("*.txt")))
     else:
-        docs = gold_attr.read_sqlite_texts(str(src), limit=args.limit)
+        docs = gold_attr.read_sqlite_texts(str(src), limit=args.limit, skip=args.skip)
     counts = gold_attr.build(docs, args.out, per_doc=args.per_doc, enriched_share=args.enriched_share)
     print(json.dumps(counts, ensure_ascii=False))
 
@@ -144,6 +144,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--texts", required=True, help="directory of *.txt or path to edrsr.db")
     p.add_argument("--out", required=True); p.add_argument("--limit", type=int)
     p.add_argument("--per-doc", type=int, default=6); p.add_argument("--enriched-share", type=float, default=0.0)
+    p.add_argument("--skip", type=int, default=0,
+                   help="skip N candidate rulings before collecting: builds a holdout "
+                        "from decisions the training slice never saw")
     p.set_defaults(fn=cmd_gold_attribution)
 
     p = sub.add_parser("gold-departures")

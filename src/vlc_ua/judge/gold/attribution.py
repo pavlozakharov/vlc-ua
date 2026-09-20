@@ -207,7 +207,7 @@ def read_sqlite_texts(db_path: str, limit: int | None = None,
                       judgment: str = "Постанова",
                       courts: tuple[str, ...] = SUPREME_COURT_CODES,
                       min_chars: int = 3000, chunk: int = 500,
-                      max_candidates: int = 100_000,
+                      max_candidates: int = 100_000, skip: int = 0,
                       progress=None) -> Iterator[tuple[str, str]]:
     """Server-side source: full texts of rulings from edrsr.db.
 
@@ -237,6 +237,12 @@ def read_sqlite_texts(db_path: str, limit: int | None = None,
     ``courts`` defaults to the Supreme Court (four cassation courts, the
     Grand Chamber, and the court's own code): the header lexicon describes
     their structure and the task asks about "постанова Верховного Суду".
+
+    ``skip`` drops that many candidates from the front before collecting, so a
+    holdout can be built from rulings the training set never saw: the pair
+    (limit, skip) carves disjoint slices out of one rowid-ordered candidate
+    list, and rowid order is publication order, so a skip is also a step back
+    in time.
     """
     import sqlite3
 
@@ -249,9 +255,10 @@ def read_sqlite_texts(db_path: str, limit: int | None = None,
     marks = ",".join("?" for _ in courts)
     want = int(limit) if limit else None
     cap = max_candidates if want is None else min(max_candidates, want * 40)
+    cap = cap + int(skip)
     cands = [r[0] for r in con.execute(
         f"SELECT rowid FROM documents WHERE court_code IN ({marks}) AND judgment_code = ? "
-        f"ORDER BY rowid DESC LIMIT {int(cap)}", (*courts, code))]
+        f"ORDER BY rowid DESC LIMIT {int(cap)}", (*courts, code))][int(skip):]
     seen = kept = 0
     for i in range(0, len(cands), chunk):
         batch = cands[i:i + chunk]
