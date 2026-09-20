@@ -21,6 +21,7 @@ from . import evalharness as ev
 from .gold import attribution as gold_attr
 from .gold import departures as gold_dep
 from .gold import screening as gold_scr
+from .gold import scrub as gold_scrub
 from .types import Answer
 
 TASKS = {**{"attribution": gold_attr.TASK}, **{k: {k: v} for k, v in gold_dep.TASK.items()},
@@ -162,6 +163,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)
     p.add_argument("--baseline"); p.add_argument("--target-precision", type=float, default=0.95)
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("scrub-gold", help="replace personal names in a gold file before upload")
+    p.add_argument("--in", dest="src", required=True); p.add_argument("--out", required=True)
+    p.set_defaults(fn=lambda a: gold_scrub.main(["--in", a.src, "--out", a.out]))
 
     p = sub.add_parser("probe-logprobs")
     p.add_argument("--base-url", required=True); p.add_argument("--model", required=True)
