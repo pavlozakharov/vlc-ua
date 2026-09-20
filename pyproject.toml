@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlc-ua"
+version = "0.0.1"
+description = "Verifiable Legal Citations for Ukrainian Law: typed decision heads, calibration and evaluation"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+http = ["httpx>=0.27"]
+train = ["torch", "transformers>=4.40", "numpy"]
+onnx = ["onnxruntime", "numpy"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+vlc-judge = "vlc_ua.judge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
