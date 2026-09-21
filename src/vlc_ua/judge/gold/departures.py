@@ -36,6 +36,7 @@ grammar's output is not a random draw from the corpus.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -72,6 +73,16 @@ TASK = {
 }
 
 
+def _digest(text: str) -> str:
+    """Stable short hash of a sentence.
+
+    ``hash()`` is salted per process (PYTHONHASHSEED), so row ids built from
+    it change on every run and an adjudication file keyed by id stops
+    matching the gold it was written against.
+    """
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
 def _row(rid: str, state: dict, question: str, gold: str, sample: str, source: str) -> dict:
     return {"id": rid, "state": state, "question": question, "gold": gold,
             "sample": sample, "source": source}
@@ -94,15 +105,21 @@ def from_departures_table(db_path: str, limit: int | None = None) -> Iterator[di
                    "departure_pair", gold, "enriched", f"grammar:{source or ''}:{kind or ''}")
 
 
+# Keys are the bucket strings the extractor actually writes
+# (extract_departures3.py, dumps ~/.edrsr/dep_rejects.jsonl and
+# dep_g_rejects.jsonl, checked 2026-09-20). Only two buckets carry a usable
+# label; the rest cannot be labelled without reading the sentence.
 BUCKET_LABEL = {
     "заперечення": "refusal",
     "генерика": "generic",
-    "без суб'єкта": None,        # unknown without reading: skip
+    "без суб'єкта ВП/ОП": None,   # unknown without reading: skip
     "без зони цілі": None,
-    "ціль не валідна": None,
+    "ціль не валідна/нема": None,
     "без «виклад»": None,
     "репорт без джерела": None,
     "інверсія": None,
+    "G-не постанова": None,
+    "G-номер перед маркером": None,
 }
 
 
@@ -121,7 +138,7 @@ def from_rejects_dump(path: str | Path, limit: int | None = None) -> Iterator[di
         if not targets:
             continue
         for t in targets[:3]:
-            yield _row(f"rej:{d.get('doc_id')}:{abs(hash(sent)) % 10**8}:{t}",
+            yield _row(f"rej:{d.get('doc_id')}:{_digest(sent)}:{t}",
                        {"sentence": sent, "target_case": t, "citing_case": d.get("cause_num")},
                        "departure_pair", label, "enriched", f"grammar-reject:{d.get('bucket')}")
             n += 1
@@ -167,9 +184,105 @@ def merge_adjudications(rows: Iterable[dict], adjudication_path: str | Path | No
 
 
 def write(rows: Iterable[dict], out_path: str | Path) -> int:
+    """Write gold JSONL, dropping repeated ids.
+
+    The same sentence is rejected once per window, so one (doc, sentence,
+    target) triple can reach the writer several times. The harness keys
+    answers by ``id``, so a duplicate id silently overwrites its twin and
+    the row count stops matching the number of questions asked.
+    """
     n = 0
+    seen: set[str] = set()
     with open(out_path, "w", encoding="utf-8") as f:
         for r in rows:
+            if r["id"] in seen:
+                continue
+            seen.add(r["id"])
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             n += 1
     return n
+
+
+# --- Evidence relabelling -------------------------------------------------
+#
+# Measured on 2026-09-20 against 48 rows read one by one (the document form,
+# "Постанова" or "Ухвала", settled the ambiguous ones):
+#
+#   * rows built from ``dep_gold.json``: in 71 of 82 pairs the target case is
+#     the case that PERFORMED the departure, not the case departed FROM, yet
+#     every such pair was labelled ``departure``. Read sample: 0 of 5 correct.
+#   * rows built from the rejects bucket "заперечення": the extractor's guard
+#     looks for a refusal within ±60 characters of the marker, which reaches
+#     into neighbouring sentences — the refusal is visible inside the dumped
+#     sentence in only 509 of 5304 rows (9.6%). Read sample: 0 of 15 correct.
+#   * rows from ``departures.kind`` other than "departure" were all labelled
+#     ``other``, but 176 of them report a performed departure from the target.
+#     Read sample: 4 of 7 wrong.
+#   * 234 of 4195 rows do not contain their own target case number: the 400
+#     character quote window cut it off, so the question cannot be answered
+#     from the row at all.
+#
+# The relabeller therefore keeps only labels that can be read off the sentence
+# itself, and drops the rest. Dropped above all: "вважає за необхідне
+# відступити" — in a ruling of the Grand Chamber or a joint chamber that IS
+# the departure, in a referral order it is only an intention, and Grand
+# Chamber rulings quote the referring panel's intention verbatim, so the
+# sentence alone does not decide. Those rows need a human.
+
+PERFORMED = re.compile(r"відступ(?:ила|ив|ило|или|ає|ають|аючи|ивши)", re.I | re.U)
+INTENT = re.compile(r"вважа\w*\s+(?:за\s+)?необхідн\w*\s+відступити|"
+                    r"дійш\w+\s+висновку\s+про\s+необхідність\s+відступ", re.I | re.U)
+REFUSED = re.compile(r"(?<![а-яіїєґ'])не\s+(?:вважа|вбача|знаход)\w*[^.]{0,50}?відступ|"
+                     r"(?<![а-яіїєґ'])не\s+відступ|відсутні\s+підстави\s+для\s+відступ|"
+                     r"нема[єе]?\s+підстав\s+для\s+відступ", re.I | re.U)
+# The referral is also written as a noun ("дійшов висновку про необхідність
+# передачі справи ... на розгляд об'єднаної палати"), and that form carries the
+# procedural article with it, so without the noun the row falls through to the
+# norm-quote rule and is labelled as a quotation of the rule instead.
+REFERRAL = re.compile(r"(?:перед(?:ає|ати|ано|аючи|ала|ав)|передач[іїу])\s+справ[уи]\s+"
+                      r"[^.]{0,100}?на\s+розгляд\s+(?:Велик|Об[’'`ʼ]?єднан|судов)", re.I | re.U)
+NORM_CITE = re.compile(r"стат(?:ті|тею|тях|тей)\s*(?:302|303|346|347|403)\b", re.I | re.U)
+GENERIC = re.compile(r"у разі,?\s+коли\s+(?:вона|Велика Палата)[^,]{0,40}відступила|"
+                     r"незалежно від того,?\s+чи перераховані", re.I | re.U)
+
+
+def evidence_label(sentence: str, target: str) -> tuple[str | None, str]:
+    """(label, why) read off the sentence, or (None, why) when it cannot be.
+
+    Order matters: an explicit refusal or a quoted procedural rule decides
+    before the direction test, because both contain the departure verb too.
+    """
+    s = sentence or ""
+    at = s.find(target)
+    if at < 0:
+        return None, "цілі немає в тексті речення"
+    if REFUSED.search(s):
+        return "refusal", "у реченні є пряма відмова відступати"
+    if GENERIC.search(s):
+        return "generic", "загальне міркування про відступ"
+    if REFERRAL.search(s):
+        return "other", "передача справи на розгляд палати"
+    perf = PERFORMED.search(s)
+    if perf:
+        if at > perf.start():
+            return "departure", "ціль стоїть після перформатива «відступив/відступила»"
+        return "other", "ціль стоїть перед перформативом: це суд, ЯКИЙ відступив"
+    if NORM_CITE.search(s):
+        return "norm_quote", "цитата процесуальної норми про порядок відступу"
+    if INTENT.search(s):
+        return None, "намір «вважає за необхідне відступити»: речення не вирішує, хто суб'єкт"
+    return None, "у реченні немає ознаки відступу"
+
+
+def relabel_by_evidence(rows: Iterable[dict]) -> Iterator[dict]:
+    """Keep only rows whose label is visible in the sentence; mark the source."""
+    for r in rows:
+        st = r.get("state") or {}
+        label, why = evidence_label(st.get("sentence", ""), st.get("target_case", ""))
+        if not label:
+            continue
+        out = dict(r)
+        out["gold"] = label
+        out["source"] = f"evidence({label}) <- {r.get('source', '')}"
+        out["evidence"] = why
+        yield out

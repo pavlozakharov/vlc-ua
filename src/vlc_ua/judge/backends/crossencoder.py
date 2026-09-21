@@ -107,16 +107,28 @@ class _OnnxImpl:
 
 
 class _TorchImpl:
+    """Dev/eval runtime. Serving uses ONNX int8 on the CPU; this one follows
+    the hardware it is given, because measuring a holdout pair-by-pair on a
+    CPU costs hours and on the training GPU costs minutes — and both paths
+    must stay inside the same harness, or "train" and "measure" drift apart.
+    ``VLC_JUDGE_DEVICE`` overrides the choice (``cpu`` to force parity with
+    production)."""
+
     def __init__(self, model_dir: str, max_length: int) -> None:
+        import os
+
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         self.torch = torch
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_dir).eval()
+        self.device = os.environ.get("VLC_JUDGE_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
         self.max_length = max_length
 
     def score(self, query: str, doc: str) -> float:
         with self.torch.no_grad():
             enc = self.tok(query, doc, truncation=True, max_length=self.max_length, return_tensors="pt")
+            enc = {k: v.to(self.device) for k, v in enc.items()}
             return float(self.model(**enc).logits.reshape(-1)[0])

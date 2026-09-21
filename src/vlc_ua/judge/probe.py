@@ -25,10 +25,12 @@ def probe(base_url: str, model: str, api_key_env: str = "LLM_API_KEY", api_key: 
         return {"base_url": base_url, "model": model, "ok": False,
                 "error": f"{type(exc).__name__}: {exc}"[:300], "seconds": time.time() - t0}
     top = max(scores, key=scores.__getitem__)
+    note = getattr(judge, "note", "")
     return {"base_url": base_url, "model": model, "ok": True, "logprobs": not degraded,
-            "top": top, "scores": scores, "seconds": time.time() - t0,
+            "top": top, "scores": scores, "seconds": time.time() - t0, "note": note,
             "verdict": ("usable: real distribution" if not degraded else
-                        "degraded: endpoint ignores logprobs; use only as a one-hot teacher")}
+                        "degraded: " + (note or "endpoint ignores logprobs")
+                        + "; use only as a one-hot teacher")}
 
 
 def main(argv: list[str] | None = None) -> None:

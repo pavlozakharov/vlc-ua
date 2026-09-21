@@ -21,6 +21,7 @@ from . import evalharness as ev
 from .gold import attribution as gold_attr
 from .gold import departures as gold_dep
 from .gold import screening as gold_scr
+from .gold import scrub as gold_scrub
 from .types import Answer
 
 TASKS = {**{"attribution": gold_attr.TASK}, **{k: {k: v} for k, v in gold_dep.TASK.items()},
@@ -36,7 +37,7 @@ def make_backend(args) -> object:
         return LogprobJudge(base_url=args.base_url, model=args.model, api_key_env=args.api_key_env)
     if args.backend == "crossencoder":
         from .backends.crossencoder import CrossEncoderHead
-        return CrossEncoderHead(args.model_dir).judge()
+        return CrossEncoderHead(args.model_dir, runtime=getattr(args, "runtime", "auto")).judge()
     if args.backend == "typesafe":
         from .backends.external import TypeSafeJudge
         return TypeSafeJudge(model=args.model or "jev-1.13.0")
@@ -58,7 +59,7 @@ def cmd_gold_attribution(args) -> None:
     if src.is_dir():
         docs = ((p.stem, p.read_text(encoding="utf-8", errors="replace")) for p in sorted(src.glob("*.txt")))
     else:
-        docs = gold_attr.read_sqlite_texts(str(src), limit=args.limit)
+        docs = gold_attr.read_sqlite_texts(str(src), limit=args.limit, skip=args.skip)
     counts = gold_attr.build(docs, args.out, per_doc=args.per_doc, enriched_share=args.enriched_share)
     print(json.dumps(counts, ensure_ascii=False))
 
@@ -71,6 +72,8 @@ def cmd_gold_departures(args) -> None:
         rows += list(gold_dep.from_departures_table(args.positions_db, limit=args.limit))
     if args.rejects:
         rows += list(gold_dep.from_rejects_dump(args.rejects, limit=args.limit))
+    if getattr(args, "evidence", False):
+        rows = list(gold_dep.relabel_by_evidence(rows))
     n = gold_dep.write(gold_dep.merge_adjudications(rows, args.adjudication), args.out)
     print(f"{n} rows -> {args.out}")
 
@@ -123,6 +126,9 @@ def cmd_serve(args) -> None:
 def _backend_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--backend", required=True,
                    choices=["keyword", "logprob", "crossencoder", "typesafe", "cloudflare", "systemone-http"])
+    p.add_argument("--runtime", default="auto", choices=["auto", "onnx", "torch"],
+                   help="crossencoder only: auto picks ONNX when model.onnx is there; "
+                        "torch is what runs the head on a GPU")
     p.add_argument("--task")
     p.add_argument("--question")
     p.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
@@ -141,11 +147,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--texts", required=True, help="directory of *.txt or path to edrsr.db")
     p.add_argument("--out", required=True); p.add_argument("--limit", type=int)
     p.add_argument("--per-doc", type=int, default=6); p.add_argument("--enriched-share", type=float, default=0.0)
+    p.add_argument("--skip", type=int, default=0,
+                   help="skip N candidate rulings before collecting: builds a holdout "
+                        "from decisions the training slice never saw")
     p.set_defaults(fn=cmd_gold_attribution)
 
     p = sub.add_parser("gold-departures")
     p.add_argument("--dep-gold"); p.add_argument("--positions-db"); p.add_argument("--rejects")
     p.add_argument("--adjudication"); p.add_argument("--limit", type=int); p.add_argument("--out", required=True)
+    p.add_argument("--evidence", action="store_true",
+                   help="label each row from the sentence itself and drop rows the sentence "
+                        "does not decide (see gold/departures.py: evidence_label)")
     p.set_defaults(fn=cmd_gold_departures)
 
     p = sub.add_parser("run"); _backend_args(p)
@@ -157,6 +169,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)
     p.add_argument("--baseline"); p.add_argument("--target-precision", type=float, default=0.95)
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("scrub-gold", help="replace personal names in a gold file before upload")
+    p.add_argument("--in", dest="src", required=True); p.add_argument("--out", required=True)
+    p.set_defaults(fn=lambda a: gold_scrub.main(["--in", a.src, "--out", a.out]))
 
     p = sub.add_parser("probe-logprobs")
     p.add_argument("--base-url", required=True); p.add_argument("--model", required=True)

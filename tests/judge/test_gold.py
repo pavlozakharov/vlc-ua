@@ -142,6 +142,96 @@ class TestNormalizeHeader:
     def test_normalize_header_collapses_spaces(self):
         assert gold_attr.normalize_header("Рух   справи") == "рух справи"
 
+    def test_cyrillic_roman_numerals_are_stripped(self):
+        """«ІV» у постановах ВС — кирилична І плюс латинська V.
+
+        Латинський клас [ivx] її не знімав, і найчастіший заголовок корпусу
+        лишався невпізнаним: 564 втрачені заголовки на 1 909 постановах.
+        """
+        assert gold_attr.normalize_header("ІV. ПОЗИЦІЯ ВЕРХОВНОГО СУДУ") == "позиція верховного суду"
+        assert gold_attr.normalize_header("VІІ. Позиція Верховного Суду") == "позиція верховного суду"
+        assert gold_attr.normalize_header("ІІІ. Фактичні обставини справи") == "фактичні обставини справи"
+        assert gold_attr.header_kind("ІV. ПОЗИЦІЯ ВЕРХОВНОГО СУДУ") == "court"
+        assert gold_attr.header_kind("І. РУХ СПРАВИ") == "procedural"
+
+    def test_numbering_stripper_keeps_running_text(self):
+        """Клас із кириличними двійниками не має з'їдати початок речення."""
+        assert gold_attr.header_kind("і суд дійшов висновку, що позивач не довів") is None
+        assert gold_attr.header_kind("м. Київ") is None
+        assert gold_attr.header_kind("с. Іванівка Полтавського району") is None
+
+
+class TestHeaderKindVariants:
+    """Варіанти заголовків, кожен заміряний у корпусі 21.09.2026."""
+
+    def test_grand_chamber_is_court(self):
+        assert gold_attr.header_kind("ПОЗИЦІЯ ВЕЛИКОЇ ПАЛАТИ") == "court"
+        assert gold_attr.header_kind("Позиція Великої Палати Верховного Суду") == "court"
+
+    def test_motives_tense_and_wording_variants(self):
+        for line in ("Мотиви, з яких виходив Верховний Суд, та застосовані норми права",
+                     "Мотиви, якими керується Верховний Суд, та застосовані норми права",
+                     "Мотиви і доводи Верховного Суду та застосовані норми права"):
+            assert gold_attr.header_kind(line) == "court", line
+
+    def test_referral_to_grand_chamber_is_procedural(self):
+        assert gold_attr.header_kind(
+            "Мотиви передачі справи на розгляд Великої Палати Верховного Суду") == "procedural"
+
+    def test_lower_court_position_beats_generic_court_rule(self):
+        """Правило court перевіряється першим, тож «позиція суду» мусить мати застереження."""
+        assert gold_attr.header_kind("Позиція суду першої інстанції") == "lower"
+        assert gold_attr.header_kind("Позиція суду апеляційної інстанції") == "lower"
+        assert gold_attr.header_kind("Позиція суду") == "court"
+
+    def test_participants_position_is_party(self):
+        assert gold_attr.header_kind("Позиція учасників справи") == "party"
+        assert gold_attr.header_kind("5. Позиція іншого учасника справи") == "party"
+
+    def test_forms_found_by_the_v3_read_control(self):
+        """Чотири зразки, кожен порахований у корпусі 21.09.2026."""
+        assert gold_attr.header_kind("Аргументи інших учасників справи") == "party"          # 35
+        assert gold_attr.header_kind("3. ВСТАНОВЛЕНІ СУДАМИ ПОПЕРЕДНІХ ІНСТАНЦІЙ "
+                                     "ОБСТАВИНИ У СПРАВІ") == "facts"                        # 33
+        assert gold_attr.header_kind("Рух касаційної скарги та матеріалів справи") == "procedural"  # 112
+        assert gold_attr.header_kind("10. Судові витрати") == "procedural"                   # 273
+
+    def test_bare_costs_header_does_not_swallow_a_sentence(self):
+        """«Судові витрати» ловиться лише як цілий рядок-заголовок."""
+        assert gold_attr.header_kind("Судові витрати стягуються з відповідача") is None
+
+    def test_spaced_out_operative_verb(self):
+        """«П О С Т А Н О В И В» — 281 такий рядок у корпусі 21.09.2026.
+
+        Нерозпізнаний, він лишає резолютивну частину всередині мотивів суду.
+        """
+        for line in ("П О С Т А Н О В И В:", "п о с т а н о в и в :",
+                     "У Х В А Л И В :", "у х в а л и в:"):
+            assert gold_attr.header_kind(line) == "procedural", line
+        assert gold_attr.normalize_header("П О С Т А Н О В И В:") == "постановив"
+
+    def test_normative_regulation_is_court(self):
+        assert gold_attr.header_kind("Нормативне регулювання") == "court"
+        assert gold_attr.header_kind("Нормативне врегулювання") == "court"
+
+
+class TestWrappedSentenceIsNotAHeader:
+    """Рядок може збігтися з лексиконом, лишаючись початком речення."""
+
+    def test_wrapped_sentence_does_not_open_a_section(self):
+        text = ("Позиція Верховного Суду\n"
+                "Суд дійшов висновку про таке. " + "Текст розділу. " * 10 + "\n"
+                "Доводи касаційної скарги про те, що належним способом захисту\n"
+                "є витребування майна, є безпідставними. " + "Продовження. " * 10 + "\n")
+        kinds = [s.kind for s in gold_attr.sections(text)]
+        assert kinds == ["court"], kinds
+
+    def test_colon_header_followed_by_lowercase_survives(self):
+        text = ("Учасники справи:\n"
+                "позивач - товариство, відповідач - орган. " + "Далі текст. " * 10 + "\n")
+        kinds = [s.kind for s in gold_attr.sections(text)]
+        assert kinds == ["procedural"], kinds
+
 
 class TestDeparturesFromDepGold:
     """Test departure pair gold building."""

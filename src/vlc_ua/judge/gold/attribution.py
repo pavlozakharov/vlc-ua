@@ -40,36 +40,75 @@ KINDS = ("court", "party", "lower", "facts", "procedural")
 
 # Order matters: first match wins. Patterns are matched on a normalized
 # header line (lowercase, single spaces, no trailing punctuation).
+#
+# Added 2026-09-20 after a sweep of real rulings (inspect over 14 decisions)
+# and a reading of 30 gold rows, where 5 of 8 mismatches were caused by an
+# unrecognised header: the section above it kept running and swallowed the
+# next section's text. Each added pattern was seen in the corpus:
+#   party      "короткий зміст вимог і доводів касаційної скарги"
+#   lower      "короткий зміст рішення суду першої інстанції" (singular)
+#   facts      "СТИСЛИЙ ВИКЛАД ОБСТАВИН СПРАВИ, ВСТАНОВЛЕНИХ СУДАМИ …",
+#              "Обставини, встановлені судами"
+#   procedural "описова частина", "учасники справи", "щодо судових витрат"
 HEADER_RULES: list[tuple[str, re.Pattern[str]]] = [
-    ("court", re.compile(r"^(позиці[яї] верховного суду|мотиви, з яких виходить верховний суд|"
+    ("court", re.compile(r"^(позиці[яї] (верховного суду|великої палати|об.єднаної палати)|"
+                         r"мотиви, з яких виход(ить|ив|ила|или)|"
+                         r"мотиви, яким[иі] керується (верховний суд|велика палата)|"
+                         r"мотиви і доводи верховного суду|"
                          r"оцінка аргументів учасників справи|мотивувальна частина|"
                          r"висновки за результатами розгляду|висновки верховного суду|"
-                         r"щодо суті касаційн|мотиви суду|позиція суду|"
-                         r"джерела права й акти їх застосування|нормативно-правове обґрунтування)")),
-    ("party", re.compile(r"^(аргументи учасників справи|доводи (особи, яка подала )?касаційн|"
+                         r"щодо суті касаційн|мотиви суду|"
+                         # «позиція суду першої інстанції» — це lower, а не court:
+                         # правило court перевіряється першим і без застереження
+                         # з'їдало заголовок нижчої інстанції.
+                         r"позиція суду(?! (першої|апеляційної|попередніх))|"
+                         r"джерела права й акти їх застосування|нормативно-правове обґрунтування|"
+                         r"нормативне [ву]?регулювання)")),
+    ("party", re.compile(r"^(аргументи (інших )?учасників справи|доводи (особи, яка подала )?касаційн|"
                          r"доводи (інших учасників|відзив|заперечен)|узагальнені доводи|"
-                         r"короткий зміст (вимог )?касаційної скарги|"
+                         r"короткий зміст (вимог (і доводів )?)?касаційної скарги|"
                          r"короткий зміст (позовних вимог|позову|заяви|скарги)|"
-                         r"позиція (позивача|відповідача|скаржника|інших учасників))")),
-    ("lower", re.compile(r"^(короткий зміст (рішень|судових рішень|оскаржуван|ухвал|постанов)|"
+                         r"позиція (позивача|відповідача|скаржника|"
+                         r"інших учасників|учасників справи|іншого учасника))")),
+    ("lower", re.compile(r"^(короткий зміст (рішень|рішення|судових рішень|оскаржуван|ухвал|постанов)|"
                          r"рішення судів (першої|попередніх)|"
                          r"позиція суд(у|ів) (першої|апеляційної|попередніх)|"
                          r"короткий зміст судових рішень судів)")),
     ("facts", re.compile(r"^(фактичні обставини справи|обставини справи|"
-                         r"встановлені судами обставини|фактичні обставини)")),
-    ("procedural", re.compile(r"^(рух справи|процесуальні дії|історія справи|"
+                         r"встановлені судами обставини|фактичні обставини|"
+                         r"стислий виклад обставин справи|виклад обставин справи|"
+                         r"обставини, встановлені суд|установлені судами обставини|"
+                         r"встановлені суд(ами|ом)[^\n]{0,45}обставини)")),
+    ("procedural", re.compile(r"^(рух (справи|касаційної скарги)|процесуальні дії|історія справи|"
                               r"надходження касаційної скарги|підстави (для )?передачі|"
+                              r"мотиви перед(ачі|ання) справи|"
                               r"межі розгляду|провадження у суді касаційної інстанції|"
                               r"розподіл судових витрат|керуючись|постановив|ухвалив|"
-                              r"резолютивна частина|щодо розподілу)")),
+                              r"резолютивна частина|щодо розподілу|щодо судових витрат|судові витрати$|"
+                              r"описова частина|учасники справи|вступна частина)")),
 ]
 
-_HEADER_LINE = re.compile(r"^\s*(?:[ivx]+\.?\s+|\d+(?:\.\d+)*\.?\s+)?([^\n]{3,90})\s*$", re.I)
+# Нумерація розділу з'їдається перед звіркою з лексиконом. Римські цифри в
+# постановах ВС набрані ЗМІШАНО: «ІV» — це кирилична І (U+0406) плюс латинська V,
+# «VІІ» — латинська V плюс дві кириличні І. Латинський клас [ivx] таку нумерацію
+# не знімає, заголовок не впізнається, і розділ тягнеться до наступного впізнаного
+# заголовка. Замір 21.09.2026 по 1 909 постановах еталона: 564 втрачені заголовки,
+# серед них найчастіший у корпусі «ПОЗИЦІЯ ВЕРХОВНОГО СУДУ».
+_NUM_PREFIX = re.compile(r"^(?:[ivxlcdmіхсм]{1,7}\.\s*|[ivxlcdmіхсм]{2,7}\s+|\d+(?:\.\d+)*\.?\s+)")
+
+
+# Резолютивне дієслово в постановах часто набране врозрядку:
+# «П О С Т А Н О В И В :». Замір 21.09.2026 по 1 909 постановах — 281 такий
+# рядок; кожен із них означав, що резолютивна частина не відокремилась і
+# поїхала в попередній розділ, найчастіше в мотиви суду.
+_SPACED_OUT = re.compile(r"^(?:[^\W\d_]\s+){3,}[^\W\d_]\s*:?\s*$")
 
 
 def normalize_header(line: str) -> str:
     s = re.sub(r"\s+", " ", line.strip().lower())
-    s = re.sub(r"^[ivx]+\.?\s+|^\d+(?:\.\d+)*\.?\s+", "", s)
+    if _SPACED_OUT.match(s):
+        s = re.sub(r"(?<=\w) (?=\w)", "", s)
+    s = _NUM_PREFIX.sub("", s)
     return s.strip(" .:;—-«»\"'")
 
 
@@ -105,8 +144,21 @@ def sections(text: str, kind_fn: Callable[[str], str | None] = header_kind) -> l
     out: list[Section] = []
     for i, (k, hdr, s, e) in enumerate(found):
         nxt = found[i + 1][2] if i + 1 < len(found) else len(text)
-        if nxt - e > 40:
-            out.append(Section(kind=k, header=hdr, start=e, end=nxt))
+        if nxt - e <= 40:
+            continue
+        # Рядок може збігтися з лексиконом, лишаючись початком речення, яке
+        # переноситься далі: «Доводи касаційної скарги про те, що належним
+        # способом захисту…» — і тоді міркування суду дістає ярлик party.
+        # Ознака — продовження з малої літери; двокрапка в кінці рядка знімає
+        # підозру, бо «Учасники справи:» — справжній заголовок, після якого
+        # теж іде мала літера (570 таких у корпусі проти ~47 обірваних речень).
+        # Довжина — друга умова: справжній заголовок короткий, обірване
+        # речення довге; без неї відсіювались би й «Рух справи» з абзацом,
+        # що починається з малої літери.
+        if (len(hdr) > 40 and not hdr.rstrip().endswith(":")
+                and text[e:nxt].lstrip()[:1].islower()):
+            continue
+        out.append(Section(kind=k, header=hdr, start=e, end=nxt))
     return out
 
 
@@ -147,8 +199,13 @@ def build(docs: Iterable[tuple[str, str]], out_path: str | Path, question: str =
     for doc_id, text in docs:
         frs = list(fragments(text, kind_fn=kind_fn))
         rnd.shuffle(frs)
-        for sec, frag in frs[:per_doc]:
-            rows.append({"id": f"{doc_id}:{sec.start}:{len(frag)}", "state": {"fragment": frag},
+        # ``sec.start`` is the section's offset, shared by every fragment of that
+        # section, and the length repeats too (max_chars truncates many to the
+        # same size), so an id built from the pair collides. Measured on the
+        # 2026-09-20 build: 155 ids repeated, 188 of 9 655 rows never reached
+        # the harness, which keys answers by id. The ordinal makes it unique.
+        for n, (sec, frag) in enumerate(frs[:per_doc]):
+            rows.append({"id": f"{doc_id}:{sec.start}:{n}:{len(frag)}", "state": {"fragment": frag},
                          "question": question, "gold": sec.kind, "sample": "random",
                          "source": f"header:{sec.header}", "doc_id": str(doc_id)})
             counts[sec.kind] += 1
@@ -182,19 +239,79 @@ TASK = {
 }
 
 
+SUPREME_COURT_CODES = ("9901", "9911", "9921", "9931", "9941", "9951")
+
+
 def read_sqlite_texts(db_path: str, limit: int | None = None,
-                      judgment: str = "Постанова") -> Iterator[tuple[str, str]]:
+                      judgment: str = "Постанова",
+                      courts: tuple[str, ...] = SUPREME_COURT_CODES,
+                      min_chars: int = 3000, chunk: int = 500,
+                      max_candidates: int = 100_000, skip: int = 0,
+                      progress=None) -> Iterator[tuple[str, str]]:
     """Server-side source: full texts of rulings from edrsr.db.
 
-    The table/column names follow the production schema documented in
-    laws_src; adjust the SQL if the schema differs. Read-only URI.
+    Production schema (``~/.edrsr/edrsr.db``, verified 2026-09-20)::
+
+        documents(doc_id TEXT PRIMARY KEY, court_code, judgment_code,
+                  justice_kind, category_code, cause_num, adjudication_date,
+                  receipt_date, judge, doc_url, status, date_publ, full_text)
+        judgment_forms(judgment_code TEXT PRIMARY KEY, name TEXT)
+
+    Three differences from the original SQL, all forced by the real schema
+    and the size of the table (~25 M rows, 39 GB):
+
+    1. columns: ``full_text`` (not ``text``), ``judgment_code`` resolved
+       through ``judgment_forms`` (not a ``judgment`` name column),
+       ``adjudication_date`` (not ``date``);
+    2. recency: there is no index on the date, so ``ORDER BY date DESC``
+       scans the table for minutes. Rows are inserted in publication order,
+       so ``rowid`` is a monotone proxy for the date (checked: the highest
+       rowids of Supreme Court rulings carry 2026-09 dates). Candidates are
+       taken index-only by ``rowid DESC`` over ``idx_doc_filter``;
+    3. missing texts: the freshest rows are cards without ``full_text`` (the
+       daily refresh writes the card first and the text later), so the
+       candidate list is walked in chunks until ``limit`` texted rulings are
+       collected, instead of taking the first ``limit`` candidates.
+
+    ``courts`` defaults to the Supreme Court (four cassation courts, the
+    Grand Chamber, and the court's own code): the header lexicon describes
+    their structure and the task asks about "постанова Верховного Суду".
+
+    ``skip`` drops that many candidates from the front before collecting, so a
+    holdout can be built from rulings the training set never saw: the pair
+    (limit, skip) carves disjoint slices out of one rowid-ordered candidate
+    list, and rowid order is publication order, so a skip is also a step back
+    in time.
     """
     import sqlite3
 
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    sql = ("SELECT doc_id, text FROM documents WHERE text IS NOT NULL AND length(text) > 3000 "
-           "AND judgment = ? ORDER BY date DESC")
-    if limit:
-        sql += f" LIMIT {int(limit)}"
-    for doc_id, text in con.execute(sql, (judgment,)):
-        yield str(doc_id), text
+    row = con.execute("SELECT judgment_code FROM judgment_forms WHERE name = ?",
+                      (judgment,)).fetchone()
+    if not row:
+        raise ValueError(f"judgment form {judgment!r} not found in judgment_forms")
+    code = row[0]
+    marks = ",".join("?" for _ in courts)
+    want = int(limit) if limit else None
+    cap = max_candidates if want is None else min(max_candidates, want * 40)
+    cap = cap + int(skip)
+    cands = [r[0] for r in con.execute(
+        f"SELECT rowid FROM documents WHERE court_code IN ({marks}) AND judgment_code = ? "
+        f"ORDER BY rowid DESC LIMIT {int(cap)}", (*courts, code))][int(skip):]
+    seen = kept = 0
+    for i in range(0, len(cands), chunk):
+        batch = cands[i:i + chunk]
+        q = ("SELECT rowid, doc_id, full_text FROM documents WHERE rowid IN (%s) "
+             "ORDER BY rowid DESC" % ",".join(str(r) for r in batch))
+        for _rid, doc_id, text in con.execute(q):
+            seen += 1
+            if not text or len(text) <= min_chars:
+                continue
+            yield str(doc_id), text
+            kept += 1
+            if want and kept >= want:
+                if progress:
+                    progress(seen, kept)
+                return
+        if progress:
+            progress(seen, kept)
