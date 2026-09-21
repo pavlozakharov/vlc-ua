@@ -37,7 +37,7 @@ def make_backend(args) -> object:
         return LogprobJudge(base_url=args.base_url, model=args.model, api_key_env=args.api_key_env)
     if args.backend == "crossencoder":
         from .backends.crossencoder import CrossEncoderHead
-        return CrossEncoderHead(args.model_dir).judge()
+        return CrossEncoderHead(args.model_dir, runtime=getattr(args, "runtime", "auto")).judge()
     if args.backend == "typesafe":
         from .backends.external import TypeSafeJudge
         return TypeSafeJudge(model=args.model or "jev-1.13.0")
@@ -126,6 +126,9 @@ def cmd_serve(args) -> None:
 def _backend_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--backend", required=True,
                    choices=["keyword", "logprob", "crossencoder", "typesafe", "cloudflare", "systemone-http"])
+    p.add_argument("--runtime", default="auto", choices=["auto", "onnx", "torch"],
+                   help="crossencoder only: auto picks ONNX when model.onnx is there; "
+                        "torch is what runs the head on a GPU")
     p.add_argument("--task")
     p.add_argument("--question")
     p.add_argument("--base-url", default="http://127.0.0.1:8000/v1")

@@ -167,3 +167,25 @@ class TestTrainingStepActuallyLearns:
         assert moved, "no weight changed: the training step did nothing"
         emb = [k for k in moved if "word_embeddings" in k]
         assert not emb, f"frozen embedding moved: {emb}"
+
+
+class TestRuntimeFlag:
+    """--runtime існує і парситься.
+
+    Прапорець додавався у _backend_args і з першого разу пішов з чужим іменем
+    парсера (`r.add_argument` замість `p.add_argument`) — CLI падав на імпорті
+    в КОЖНІЙ підкоманді, не лише в run. Дешевий прогін --help це ловить.
+    """
+
+    def test_run_help_lists_runtime(self):
+        import subprocess
+        import sys
+        from pathlib import Path as _P
+
+        root = str(_P(__file__).resolve().parents[2])
+        out = subprocess.run([sys.executable, "-m", "vlc_ua.judge.cli", "run", "--help"],
+                             capture_output=True, text=True, cwd=root,
+                             env={"PYTHONPATH": root + "/src", "PATH": "/usr/bin:/bin"})
+        assert out.returncode == 0, out.stderr
+        assert "--runtime" in out.stdout
+        assert "torch" in out.stdout
