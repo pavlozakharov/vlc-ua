@@ -49,10 +49,15 @@ class ScoringJudge:
     """
 
     def __init__(self, score_fn: ScoreFn, name: str = "scoring",
-                 temperatures: Mapping[str, float] | None = None) -> None:
+                 temperatures: Mapping[str, float] | None = None,
+                 fingerprint: str = "") -> None:
         self.score_fn = score_fn
         self.name = name
         self.temperatures = dict(temperatures or {})
+        # What this judge IS, beyond its name: the rules it compiled, the head
+        # it loaded. Goes into the answer cache key, so a judge that changed
+        # behaviour under an unchanged name cannot serve its old answers.
+        self.fingerprint = fingerprint
 
     def raw_scores(self, state: State, questions: Mapping[str, Question]) -> dict[str, dict[str, float]]:
         return {qname: {opt: float(self.score_fn(state, q, opt)) for opt in q.options}

@@ -57,6 +57,11 @@ class TypeSafeJudge:
     zero_data_retention: bool = True
     name: str = "typesafe"
 
+    @property
+    def fingerprint(self) -> str:
+        """Which remote model, at which endpoint — the cache must not mix them."""
+        return f"{self.base_url}|{self.model}"
+
     def ask(self, state: State, questions: Mapping[str, Question]) -> dict[str, Answer]:
         key = self.api_key or os.environ.get("TYPESAFE_API_KEY")
         if not key:
@@ -85,6 +90,11 @@ class CloudflareJudge:
     timeout: float = 30.0
     name: str = "cloudflare-jev"
 
+    @property
+    def fingerprint(self) -> str:
+        """Which remote model, at which endpoint — the cache must not mix them."""
+        return f"{self.model}"
+
     def ask(self, state: State, questions: Mapping[str, Question]) -> dict[str, Answer]:
         acct = self.account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
         tok = self.api_token or os.environ.get("CLOUDFLARE_API_TOKEN")
@@ -107,6 +117,11 @@ class SystemOneHTTPJudge:
     model: str = "local"
     timeout: float = 60.0
     name: str = "systemone-http"
+
+    @property
+    def fingerprint(self) -> str:
+        """Which remote model, at which endpoint — the cache must not mix them."""
+        return f"{self.base_url}|{self.model}"
 
     def ask(self, state: State, questions: Mapping[str, Question]) -> dict[str, Answer]:
         body = {"model": self.model, "state": state,

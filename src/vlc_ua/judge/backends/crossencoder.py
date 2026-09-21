@@ -25,6 +25,7 @@ training script lives in :mod:`vlc_ua.judge.train.crossencoder`.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -80,7 +81,11 @@ class CrossEncoderHead:
 
     def judge(self, name: str = "crossencoder", temperatures: Mapping[str, float] | None = None) -> ScoringJudge:
         temps = temperatures if temperatures is not None else self.meta.get("temperatures", {})
-        return ScoringJudge(self.score, name=name, temperatures=temps)
+        # Two heads answer under the same backend name; the cache must not mix
+        # their answers, so the key carries which head, which runtime, which
+        # window.
+        fp = f"{self.model_dir}|{type(self._impl).__name__}|{self.max_length}"
+        return ScoringJudge(self.score, name=name, temperatures=temps, fingerprint=fp)
 
 
 def onnx_threads() -> int:
@@ -102,10 +107,24 @@ def onnx_threads() -> int:
     """
     import os
 
-    env = os.environ.get("VLC_JUDGE_ONNX_THREADS")
-    if env is not None:
-        return max(0, int(env))
-    return max(1, (os.cpu_count() or 4) - 2)
+    default = max(1, (os.cpu_count() or 4) - 2)
+    env = (os.environ.get("VLC_JUDGE_ONNX_THREADS") or "").strip()
+    if not env:
+        return default
+    try:
+        want = int(env)
+    except ValueError:
+        # A typo must not stop the head from loading, and must not silently
+        # pick a setting either — say so and take the measured default.
+        print(f"VLC_JUDGE_ONNX_THREADS={env!r} is not a number; using {default}",
+              file=sys.stderr)
+        return default
+    if want < 0:
+        # Negative used to collapse to 0, which means "let ORT decide" — the
+        # single worst setting measured (9.99 s/question against 6.03).
+        print(f"VLC_JUDGE_ONNX_THREADS={want} is negative; using {default}", file=sys.stderr)
+        return default
+    return want
 
 
 class _OnnxImpl:

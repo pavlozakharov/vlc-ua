@@ -32,8 +32,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .backend import Judge
-from .calibration import (Labelled, accuracy, brier, confusion, ece, fit_temperature,
-                          fit_threshold, split)
+from .calibration import (Labelled, accuracy, apply_threshold, brier, confusion, ece,
+                          fit_temperature, fit_threshold, split)
 from .types import Answer, Question, question_from_dict
 
 
@@ -51,9 +51,22 @@ def load_gold(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _item_key(backend_name: str, task_version: str, row: Mapping[str, Any]) -> str:
+def _item_key(backend_name: str, task_version: str, row: Mapping[str, Any],
+              fingerprint: str = "") -> str:
+    """Cache key for one answer.
+
+    ``fingerprint`` is what the backend itself says it is: the rules it
+    compiled, the model directory it loaded, the remote model it will call.
+    Without it the key was (name | task_version | state | question), and a
+    backend whose BEHAVIOUR changed under an unchanged name served its old
+    answers as new ones. That is not hypothetical: after the tie-break fix of
+    21.09.2026 a run of ``keyword:departure_pair`` over departures-v7 hit the
+    default cache 2 070 times out of 2 070, and 352 of those answers (17.0%)
+    had a different top choice than the current code produces.
+    """
     h = hashlib.sha256()
     h.update(backend_name.encode()); h.update(b"|"); h.update(task_version.encode())
+    h.update(b"|"); h.update(fingerprint.encode())
     h.update(b"|"); h.update(json.dumps(row.get("state"), ensure_ascii=False, sort_keys=True).encode())
     h.update(b"|"); h.update(str(row.get("question")).encode())
     return h.hexdigest()
@@ -63,6 +76,7 @@ def _item_key(backend_name: str, task_version: str, row: Mapping[str, Any]) -> s
 class RunResult:
     backend: str
     task_version: str
+    fingerprint: str = ""
     answers: dict[str, Answer] = field(default_factory=dict)   # item id -> answer
     seconds: dict[str, float] = field(default_factory=dict)
     failures: dict[str, str] = field(default_factory=dict)
@@ -70,10 +84,18 @@ class RunResult:
 
 def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str, Any]],
         cache_dir: str | Path | None = ".judge-cache", task_version: str = "v1",
-        limit: int | None = None) -> RunResult:
-    """Ask the backend every gold item's question; cache raw answers on disk."""
+        limit: int | None = None, accept_legacy_cache: bool = False) -> RunResult:
+    """Ask the backend every gold item's question; cache raw answers on disk.
+
+    ``accept_legacy_cache`` reads entries written before backends carried a
+    fingerprint. It is an explicit escape hatch for resuming a long run whose
+    backend demonstrably has not changed, never a default: the whole point of
+    the fingerprint is that such entries cannot be told apart otherwise.
+    """
     res = RunResult(backend=getattr(backend, "name", backend.__class__.__name__),
                     task_version=task_version)
+    fingerprint = str(getattr(backend, "fingerprint", "") or "")
+    res.fingerprint = fingerprint
     cache = Path(cache_dir) if cache_dir else None
     if cache:
         cache.mkdir(parents=True, exist_ok=True)
@@ -82,8 +104,12 @@ def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str
             break
         qn = row["question"]
         q = task[qn]
-        key = _item_key(res.backend, task_version, row)
+        key = _item_key(res.backend, task_version, row, fingerprint)
         cpath = cache / f"{key}.json" if cache else None
+        if cache and accept_legacy_cache and not cpath.exists():
+            legacy = cache / f"{_item_key(res.backend, task_version, row)}.json"
+            if legacy.exists():
+                cpath = legacy
         if cpath and cpath.exists():
             d = json.loads(cpath.read_text(encoding="utf-8"))
             res.answers[row["id"]] = Answer.from_probs(q, d["probabilities"])
@@ -139,6 +165,15 @@ def report(result: RunResult, gold: list[Mapping[str, Any]], target_precision: f
             "threshold": fit_threshold(test, target_precision, "random", temp).as_dict(),
             "confusion": confusion(test, temp),
         }
+        # The honest one: threshold chosen on the dev half, queue measured on
+        # the test half. ``threshold`` above is fitted on the very rows it
+        # then scores, so its "achieved_precision" is always the target — it
+        # is kept for continuity with earlier reports, not because it means
+        # anything about a production queue. Admission should read this.
+        if dev:
+            tau = fit_threshold(dev, target_precision, "random", fit_temperature(dev)).threshold
+            out["random"]["threshold_heldout"] = apply_threshold(
+                test, tau, target_precision, "random", temp).as_dict()
     if enr:
         out["enriched"] = {
             "sensitivity_accuracy": accuracy(enr, temp), "ece": ece(enr, temp),

@@ -30,9 +30,16 @@ Sources on the server:
 * ``dep_gold.json`` positions with an ``evidence.quote``: human-curated
   (official LPD markup) positives, marked ``source="lpd"``.
 
-Adjudicated rows (a human read the sentence) get ``source="human"`` and
-``sample="random"``; everything else is ``sample="enriched"`` because the
-grammar's output is not a random draw from the corpus.
+Adjudicated rows get ``sample="random"``; everything else is
+``sample="enriched"``, because neither the grammar's output nor a curated
+collection is a random draw from the corpus.
+
+``source`` on an adjudicated row says WHO ruled on it, taken from the ``by``
+field of the adjudication file and defaulting to ``"human"``. It is not a
+synonym for a person: the 240 pairs read on 21.09.2026 were read by language
+models, two independently per row plus a third on disagreement, and they
+carry ``model-2of2`` / ``model-tiebreak``. A gold row that claims a human
+read it, when none did, is the one defect no later measurement can detect.
 """
 from __future__ import annotations
 
@@ -167,6 +174,23 @@ def from_dep_gold(path: str | Path) -> Iterator[dict]:
                            "departure_pair", "departure", "enriched", "lpd")
 
 
+def unmatched_adjudications(rows: Iterable[dict], adjudication_path: str | Path | None) -> list[str]:
+    """Adjudication ids that no source row carries.
+
+    A verdict whose row is gone is a reading that silently leaves the gold.
+    It has already happened: of the 48 rows read on 20.09 only 25 survive into
+    the 21.09 build, because the source query's ordering and limit changed and
+    the other 23 ids are no longer produced. Silence there turns "I could not
+    find it" into "there is nothing", which is the confusion this project
+    spends most of its rules on.
+    """
+    want = set(adjudicated_ids(adjudication_path))
+    if not want:
+        return []
+    have = {r.get("id") for r in rows}
+    return sorted(want - have)
+
+
 def merge_adjudications(rows: Iterable[dict], adjudication_path: str | Path | None) -> Iterator[dict]:
     """Overlay human verdicts: ``{"id": ..., "gold": ...}`` per line.
 
@@ -277,19 +301,28 @@ def evidence_label(sentence: str, target: str) -> tuple[str | None, str]:
     here so that nobody spends an evening rediscovering them:
 
     * a direction test for the refusal, mirroring the one the performative
-      has — **80.8%**, worse than doing nothing. It repaired the 7 rows where
-      the target is the ruling that did not depart, and broke 9 where the
+      has, in both available shapes: judging by the FIRST mention of the
+      target gives **80.8%** (97/120, repaired 5 rows, broke 10), judging by
+      ANY mention after the marker gives **81.7%** (98/120, repaired 6, broke
+      10). Both are worse than doing nothing. It repairs rows where the
+      target is the ruling that did not depart, and breaks more where the
       conclusion departed from is simply named before the verb ("від
       висновків, викладених у постановах … № X, … Велика Палата не
       відступила"). Ukrainian fronts that object routinely, so position alone
-      cannot separate subject from object here. What remains true: roughly
-      half of the ``refusal`` rows in this gold name the ruling that refused
-      rather than the conclusion refused from. The fix is grammatical, not
-      positional — or it is the head's job, which is the better argument for
-      training one.
-    * counting ANY later mention of the target instead of the first —
-      **85.0%**, exactly the base: it repaired one truncated sentence and
-      broke one other. No evidence either way, so the simpler rule stays.
+      cannot separate subject from object here. What remains true: on 240
+      read pairs the ``refusal`` class is right 60.3% of the time — it names
+      the ruling that refused rather than the conclusion refused from in two
+      rows out of five. The fix is grammatical, not positional, or it is the
+      head's job, which is the better argument for training one.
+    * counting ANY later mention of the target instead of the first, for the
+      performative alone — **85.0%**, exactly the base: repaired one
+      truncated sentence, broke one other. No evidence either way, so the
+      simpler rule stays.
+
+    (An earlier version of this docstring said the direction test repaired 7
+    and broke 9. That was carried over from the confusion table rather than
+    counted on the run, and it is wrong in the direction that flatters the
+    idea — it puts the variant two rows from break-even instead of five.)
     """
     s = sentence or ""
     at = s.find(target)

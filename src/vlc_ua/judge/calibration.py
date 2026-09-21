@@ -173,6 +173,39 @@ def fit_threshold(items: Sequence[Labelled], target_precision: float,
                            accepted=n, total=len(rows), sample_kind=sample_kind)
 
 
+def apply_threshold(items: Sequence[Labelled], threshold: float, target_precision: float,
+                    sample_kind: str, temperature: float = 1.0) -> ThresholdReport:
+    """What a threshold fitted elsewhere actually delivers on THESE items.
+
+    :func:`fit_threshold` searches a set and returns the point of maximum
+    coverage that still meets the target ON THAT SET. Reporting that number
+    as the queue size is the oldest trick there is: the threshold has seen
+    the answers it is being scored against. Measured 21.09.2026, fitting on
+    the dev half and applying here instead:
+
+        head v5, first 500 holdout rows   coverage 0.680 -> 0.588 (precision 0.973)
+        jev-1.13.0, same rows             coverage 0.244 -> 0.424 (precision 0.887)
+        jev-1.13.0, departure pairs       coverage 0.333 -> 0.000 on this split
+
+    Coverage can move either way; what does not survive is the PROMISE. The
+    in-sample number always reads "precision 0.95" because that is what it
+    was chosen to read.
+    """
+    if sample_kind not in ("random", "enriched"):
+        raise ValueError("sample_kind must be 'random' or 'enriched'")
+    ok = n = 0
+    for it in items:
+        pr = _probs(it, temperature)
+        top = max(pr, key=pr.__getitem__)
+        if confidence_of_probs(pr) >= threshold:
+            n += 1
+            ok += 1 if top == it.gold else 0
+    return ThresholdReport(threshold=threshold, target_precision=target_precision,
+                           achieved_precision=(ok / n) if n else 0.0,
+                           coverage=n / max(len(items), 1), accepted=n,
+                           total=len(items), sample_kind=sample_kind)
+
+
 def confusion(items: Sequence[Labelled], temperature: float = 1.0) -> dict[str, dict[str, int]]:
     """gold -> predicted -> count. The direction of errors is the diagnosis."""
     out: dict[str, dict[str, int]] = {}

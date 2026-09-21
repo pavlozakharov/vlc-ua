@@ -364,33 +364,60 @@ class TestExternalJudge:
 
 
 class TestKeywordFallbackWinsTheTie:
-    """The docstring promised it; until 21.09.2026 the code did not do it."""
+    """The docstring promised it; until 21.09.2026 the code did not do it.
 
-    def test_fallback_option_wins_when_no_rule_fires(self):
+    The task is built here, not read from a file outside the repository, and
+    the assertion is on the FALLBACK BEATING the rest rather than on argmax —
+    argmax resolves a tie by key order, which is precisely the accident this
+    fix removes, so a test leaning on it would go green with the bug back.
+    """
+
+    @staticmethod
+    def _task():
+        from vlc_ua.judge.gold.departures import TASK
+        from vlc_ua.judge.types import question_from_dict
+
+        return {"departure_pair": question_from_dict(TASK["departure_pair"])}
+
+    def test_fallback_strictly_beats_every_option_when_no_rule_fires(self):
         from vlc_ua.judge.backends.keyword import make_keyword_judge
-        from vlc_ua.judge.evalharness import load_task
 
         judge = make_keyword_judge("departure_pair")
-        task = load_task("/srv/work/judge/departure_pair.task.json")
         state = {"sentence": "Текст без жодної ознаки відступу.", "target_case": "1/2/20"}
 
-        ans = judge.ask(state, task)["departure_pair"]
-        top = max(ans.probabilities, key=ans.probabilities.__getitem__)
+        probs = judge.ask(state, self._task())["departure_pair"].probabilities
+        rest = [v for k, v in probs.items() if k != "other"]
 
-        assert top == "other"
+        assert all(probs["other"] > v for v in rest), probs
 
     def test_a_firing_rule_still_beats_the_fallback(self):
         from vlc_ua.judge.backends.keyword import make_keyword_judge
-        from vlc_ua.judge.evalharness import load_task
 
         judge = make_keyword_judge("departure_pair")
-        task = load_task("/srv/work/judge/departure_pair.task.json")
         state = {"sentence": "Велика Палата відступила від висновку у справі № 1/2/20.",
                  "target_case": "1/2/20"}
 
-        ans = judge.ask(state, task)["departure_pair"]
+        probs = judge.ask(state, self._task())["departure_pair"].probabilities
 
-        assert max(ans.probabilities, key=ans.probabilities.__getitem__) == "departure"
+        assert probs["departure"] > probs["other"], probs
+
+    def test_the_intent_to_depart_is_no_longer_filed_as_a_norm_quote(self):
+        """By the task's own criteria norm_quote is a QUOTATION of the rule.
+        "вважає за необхідне відступити" is an intent and "передає справу на
+        розгляд палати" a referral; both are other, and while they sat in the
+        norm_quote rules the baseline answered norm_quote 13 times in 60 on
+        the read slice."""
+        from vlc_ua.judge.backends.keyword import make_keyword_judge
+
+        judge = make_keyword_judge("departure_pair")
+        state = {"sentence": "Колегія суддів вважає за необхідне відступити від висновку, "
+                             "викладеного у справі № 1/2/20, і передає справу на розгляд "
+                             "об'єднаної палати.",
+                 "target_case": "1/2/20"}
+
+        probs = judge.ask(state, self._task())["departure_pair"].probabilities
+
+        assert probs["norm_quote"] <= probs["other"], probs
 
 
 class TestOnnxThreadBudget:
@@ -421,3 +448,35 @@ class TestOnnxThreadBudget:
         monkeypatch.setattr("os.cpu_count", lambda: 1)
 
         assert ce.onnx_threads() == 1
+
+
+class TestOnnxThreadBudgetSurvivesBadInput:
+    """A typo must not stop the head loading, and must not silently select the
+    one setting the profile rejected (0 = "let ORT decide", 9.99 s/question
+    against 6.03)."""
+
+    def test_garbage_falls_back_to_the_measured_default(self, monkeypatch, capsys):
+        from vlc_ua.judge.backends import crossencoder as ce
+
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        monkeypatch.setenv("VLC_JUDGE_ONNX_THREADS", "шість")
+
+        assert ce.onnx_threads() == 6
+        assert "not a number" in capsys.readouterr().err
+
+    def test_empty_string_is_not_a_setting(self, monkeypatch):
+        from vlc_ua.judge.backends import crossencoder as ce
+
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        monkeypatch.setenv("VLC_JUDGE_ONNX_THREADS", "  ")
+
+        assert ce.onnx_threads() == 6
+
+    def test_negative_does_not_collapse_into_let_ort_decide(self, monkeypatch, capsys):
+        from vlc_ua.judge.backends import crossencoder as ce
+
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        monkeypatch.setenv("VLC_JUDGE_ONNX_THREADS", "-1")
+
+        assert ce.onnx_threads() == 6
+        assert "negative" in capsys.readouterr().err

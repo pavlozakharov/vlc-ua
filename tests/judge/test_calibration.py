@@ -314,3 +314,49 @@ class TestSplit:
 
         # No overlap between dev and test
         assert len(dev_ids & test_ids) == 0
+
+
+class TestHeldOutThreshold:
+    """fit_threshold searches the set it is given and returns the point of
+    maximum coverage that still meets the target THERE, so its achieved
+    precision is the target by construction. apply_threshold is the honest
+    half: a threshold chosen elsewhere, measured here."""
+
+    @staticmethod
+    def _items(pairs):
+        from vlc_ua.judge.calibration import Labelled
+        return [Labelled(scores={"yes": p, "no": 1.0 - p}, gold=("yes" if hit else "no"),
+                         is_probability=True) for p, hit in pairs]
+
+    def test_a_threshold_from_elsewhere_can_miss_the_target(self):
+        from vlc_ua.judge.calibration import apply_threshold
+
+        # висока впевненість, але половина відповідей хибна
+        items = self._items([(0.99, True), (0.99, False), (0.98, True), (0.98, False)])
+
+        rep = apply_threshold(items, 0.5, 0.95, "random")
+
+        assert rep.coverage == 1.0
+        assert rep.achieved_precision == 0.5
+        assert rep.target_precision == 0.95
+
+    def test_in_sample_fitting_always_reports_the_target_met(self):
+        from vlc_ua.judge.calibration import fit_threshold
+
+        items = self._items([(0.99, True), (0.99, False), (0.98, True), (0.98, False)])
+
+        assert fit_threshold(items, 0.95, "random").achieved_precision in (0.0, 1.0)
+
+    def test_nothing_accepted_is_not_a_precision_of_one(self):
+        from vlc_ua.judge.calibration import apply_threshold
+
+        rep = apply_threshold(self._items([(0.4, True)]), 0.9, 0.95, "random")
+
+        assert rep.accepted == 0 and rep.achieved_precision == 0.0 and rep.coverage == 0.0
+
+    def test_sample_kind_is_still_guarded(self):
+        import pytest
+        from vlc_ua.judge.calibration import apply_threshold
+
+        with pytest.raises(ValueError):
+            apply_threshold(self._items([(0.9, True)]), 0.5, 0.95, "whatever")

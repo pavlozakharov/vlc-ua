@@ -74,16 +74,23 @@ def cmd_gold_departures(args) -> None:
         rows += list(gold_dep.from_rejects_dump(args.rejects, limit=args.limit))
     if getattr(args, "evidence", False):
         rows = list(gold_dep.relabel_by_evidence(rows, gold_dep.adjudicated_ids(args.adjudication)))
+    missing = gold_dep.unmatched_adjudications(rows, args.adjudication)
     n = gold_dep.write(gold_dep.merge_adjudications(rows, args.adjudication), args.out)
     print(f"{n} rows -> {args.out}")
+    if missing:
+        print(f"WARNING: {len(missing)} adjudicated rows are not in the sources and "
+              f"their verdicts are lost: {', '.join(missing[:5])}"
+              f"{' ...' if len(missing) > 5 else ''}", file=sys.stderr)
 
 
 def cmd_run(args) -> None:
     task = ev.load_task(args.task)
     gold = ev.load_gold(args.gold)
     backend = make_backend(args)
-    res = ev.run(backend, task, gold, cache_dir=args.cache, task_version=args.task_version, limit=args.limit)
+    res = ev.run(backend, task, gold, cache_dir=args.cache, task_version=args.task_version,
+                 limit=args.limit, accept_legacy_cache=args.accept_legacy_cache)
     payload = {"backend": res.backend, "task_version": res.task_version,
+               "fingerprint": res.fingerprint,
                "answers": {k: a.as_dict() for k, a in res.answers.items()},
                "seconds": res.seconds, "failures": res.failures}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +170,12 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("run"); _backend_args(p)
     p.add_argument("--gold", required=True); p.add_argument("--out", required=True)
     p.add_argument("--cache", default=".judge-cache"); p.add_argument("--task-version", default="v1")
-    p.add_argument("--limit", type=int); p.set_defaults(fn=cmd_run)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--accept-legacy-cache", action="store_true",
+                   help="read cache entries written before backends carried a fingerprint. "
+                        "Only for resuming a run whose backend has not changed: such entries "
+                        "cannot be told apart from stale ones")
+    p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("report")
     p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)

@@ -11,6 +11,8 @@ baseline's "confidence" is honest about being a rule.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Mapping
 
@@ -37,9 +39,15 @@ _ATTR = {
 _DEP = {
     "departure": [r"відступ(ила|ив|лено|ає|ають|аючи|ивши) від (висновк|правов\w+ позиці|правов\w+ висновк)"],
     "refusal": [r"не (вбачає|знаходить|вбачають|знайшла) підстав для відступ", r"відсутні підстави для відступ",
-                r"немає підстав (для )?відступ"],
-    "norm_quote": [r"вважає за необхідне відступити", r"якщо (ця )?колегія вважає за необхідне відступити",
-                   r"передає справу на розгляд .{0,40}палати"],
+                r"немає підстав (для )?відступ", r"не відступ(ила|ив|ило|или)"],
+    # За критеріями задачі norm_quote — це ЦИТАТА процесуальної норми про
+    # порядок відступу. Досі тут стояли «вважає за необхідне відступити» і
+    # «передає справу на розгляд палати»: перше — намір, друге — передача, і
+    # обидва за тими самими критеріями належать до other. Замір 21.09.2026 на
+    # прочитаному зрізі departures-v7: саме ці два правила давали
+    # other → norm_quote 10 разів і refusal → norm_quote 3 рази з 60.
+    "norm_quote": [r"частин(ою|и) (другою|другої) статт[іі] 30[23]",
+                   r"стат(тею|ті) (30[23]|34[67]|403) (ГПК|ЦПК|КАС)"],
     "generic": [r"у разі, коли .{0,60}відступ", r"незалежно від того,? чи", r"неодноразово наголошувала"],
     "other": [],
 }
@@ -89,6 +97,9 @@ def make_keyword_judge(question_name: str, base: float = 0.1, hit: float = 1.5) 
     """
     rules = RULES[question_name]
     compiled = {opt: [re.compile(p, re.I) for p in pats] for opt, pats in rules.items()}
+    fingerprint = hashlib.sha256(
+        json.dumps([question_name, rules, base, hit], ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()[:16]
 
     def score(state: State, question: Question, option: str) -> float:
         text = _text_of(state).lower()
@@ -98,4 +109,4 @@ def make_keyword_judge(question_name: str, base: float = 0.1, hit: float = 1.5) 
         hits = sum(1 for rx in pats if rx.search(text))
         return base + hit * hits if hits else 0.0
 
-    return ScoringJudge(score, name=f"keyword:{question_name}")
+    return ScoringJudge(score, name=f"keyword:{question_name}", fingerprint=fingerprint)

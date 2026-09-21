@@ -78,6 +78,11 @@ class LogprobJudge:
     lang: str = "uk"
     system: str = ("Ти — класифікатор. Ти не пишеш пояснень, лише обираєш варіант.")
     name: str = "logprob"
+
+    @property
+    def fingerprint(self) -> str:
+        """Which remote model, at which endpoint — the cache must not mix them."""
+        return f"{self.base_url}|{self.model}"
     user_agent: str = "vlc-ua-judge/0.1"
     note: str = ""   # why a call degraded, filled per request
 

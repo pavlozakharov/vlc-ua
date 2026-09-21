@@ -281,3 +281,62 @@ class TestWinsLosses:
 
         assert comp["wins"] == 10
         assert comp["losses"] == 0
+
+
+class TestCacheKeyCarriesTheBackendFingerprint:
+    """A backend whose behaviour changed under an unchanged name used to serve
+    its old answers as new. Measured on 21.09.2026: after the tie-break fix a
+    run of keyword:departure_pair over 2 070 rows hit the default cache 2 070
+    times, 352 of them (17.0%) with a different top choice."""
+
+    def test_a_different_fingerprint_is_a_different_key(self):
+        from vlc_ua.judge import evalharness as ev
+
+        row = {"id": "r1", "state": {"s": "текст"}, "question": "q", "gold": "a"}
+        a = ev._item_key("keyword:q", "v1", row, "rules-before")
+        b = ev._item_key("keyword:q", "v1", row, "rules-after")
+
+        assert a != b
+
+    def test_no_fingerprint_keeps_the_legacy_key(self):
+        from vlc_ua.judge import evalharness as ev
+
+        row = {"id": "r1", "state": {"s": "текст"}, "question": "q", "gold": "a"}
+
+        assert ev._item_key("keyword:q", "v1", row) == ev._item_key("keyword:q", "v1", row, "")
+
+    def test_changed_rules_are_not_served_from_the_cache(self, tmp_path):
+        from vlc_ua.judge import evalharness as ev
+        from vlc_ua.judge.backend import ScoringJudge
+        from vlc_ua.judge.types import question_from_dict
+
+        task = {"q": question_from_dict({"type": "choice", "instructions": "i",
+                                         "criteria": {"yes": "y", "no": "n"}})}
+        gold = [{"id": "r1", "state": "текст", "question": "q", "gold": "yes"}]
+        before = ScoringJudge(lambda s, q, o: 1.0 if o == "yes" else 0.0,
+                              name="rule", fingerprint="v1")
+        after = ScoringJudge(lambda s, q, o: 1.0 if o == "no" else 0.0,
+                             name="rule", fingerprint="v2")
+
+        ev.run(before, task, gold, cache_dir=tmp_path)
+        res = ev.run(after, task, gold, cache_dir=tmp_path)
+        probs = res.answers["r1"].probabilities
+
+        assert probs["no"] > probs["yes"]
+
+    def test_the_legacy_escape_hatch_is_opt_in(self, tmp_path):
+        from vlc_ua.judge import evalharness as ev
+        from vlc_ua.judge.backend import ScoringJudge
+        from vlc_ua.judge.types import question_from_dict
+
+        task = {"q": question_from_dict({"type": "choice", "instructions": "i",
+                                         "criteria": {"yes": "y", "no": "n"}})}
+        gold = [{"id": "r1", "state": "текст", "question": "q", "gold": "yes"}]
+        legacy = ScoringJudge(lambda s, q, o: 1.0 if o == "yes" else 0.0, name="rule")
+        fingerprinted = ScoringJudge(lambda s, q, o: 1.0 if o == "no" else 0.0,
+                                     name="rule", fingerprint="v2")
+
+        ev.run(legacy, task, gold, cache_dir=tmp_path)
+        reused = ev.run(fingerprinted, task, gold, cache_dir=tmp_path, accept_legacy_cache=True)
+
+        assert reused.answers["r1"].probabilities["yes"] > 0.5
