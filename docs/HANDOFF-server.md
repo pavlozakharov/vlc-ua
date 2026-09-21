@@ -136,6 +136,23 @@ vlc-judge report runs/logprob-attribution.json --task attribution.task.json \
 Вичерпана квота або 429 з'являються у звіті як `failures`, це окремий клас
 результату; документ із таким статусом не отримує вердикту.
 
+## Крок 6-а. Необов'язково: jev як точка порівняння і учитель
+
+Якщо є ключ TypeSafe у `~/.secrets/typesafe.env` (реєстрація самостійна на
+console.typesafe.ai; ключ ніколи не копіювати в репозиторій чи звіт):
+
+```bash
+set -a; . ~/.secrets/typesafe.env; set +a
+vlc-judge run --backend typesafe --model jev-1.13.0 --task attribution.task.json \
+  --gold attribution.jsonl --limit 500 --out runs/jev-attribution.json
+vlc-judge report runs/jev-attribution.json --task attribution.task.json \
+  --gold attribution.jsonl --baseline runs/kw-attribution.json > reports/jev-attribution.json
+```
+
+Лише публічні тексти ЄДРСР; версію моделі пінити, не використовувати
+алiас `jev-latest`. У звіт іде точність, ECE, поріг і wins/losses проти
+keyword-бейзлайну: це перший замір jev на українському юридичному тексті.
+
 ## Крок 7. Звіт
 
 Файл `/srv/work/judge/REPORT.md`, українською, без оцінок «добре/погано»,
