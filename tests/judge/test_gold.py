@@ -200,6 +200,38 @@ class TestHeaderKindVariants:
         """«Судові витрати» ловиться лише як цілий рядок-заголовок."""
         assert gold_attr.header_kind("Судові витрати стягуються з відповідача") is None
 
+    def test_spaced_out_operative_verb(self):
+        """«П О С Т А Н О В И В» — 281 такий рядок у корпусі 21.09.2026.
+
+        Нерозпізнаний, він лишає резолютивну частину всередині мотивів суду.
+        """
+        for line in ("П О С Т А Н О В И В:", "п о с т а н о в и в :",
+                     "У Х В А Л И В :", "у х в а л и в:"):
+            assert gold_attr.header_kind(line) == "procedural", line
+        assert gold_attr.normalize_header("П О С Т А Н О В И В:") == "постановив"
+
+    def test_normative_regulation_is_court(self):
+        assert gold_attr.header_kind("Нормативне регулювання") == "court"
+        assert gold_attr.header_kind("Нормативне врегулювання") == "court"
+
+
+class TestWrappedSentenceIsNotAHeader:
+    """Рядок може збігтися з лексиконом, лишаючись початком речення."""
+
+    def test_wrapped_sentence_does_not_open_a_section(self):
+        text = ("Позиція Верховного Суду\n"
+                "Суд дійшов висновку про таке. " + "Текст розділу. " * 10 + "\n"
+                "Доводи касаційної скарги про те, що належним способом захисту\n"
+                "є витребування майна, є безпідставними. " + "Продовження. " * 10 + "\n")
+        kinds = [s.kind for s in gold_attr.sections(text)]
+        assert kinds == ["court"], kinds
+
+    def test_colon_header_followed_by_lowercase_survives(self):
+        text = ("Учасники справи:\n"
+                "позивач - товариство, відповідач - орган. " + "Далі текст. " * 10 + "\n")
+        kinds = [s.kind for s in gold_attr.sections(text)]
+        assert kinds == ["procedural"], kinds
+
 
 class TestDeparturesFromDepGold:
     """Test departure pair gold building."""
