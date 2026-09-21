@@ -1,172 +1,136 @@
 # Передача: сесія Claude Code на сервері edrsr
 
 Скопіювати цей файл цілком у першу репліку сесії `claude` на сервері.
-Мета сесії: побудувати еталони для голів `attribution` і `departure_pair`
-з реальних даних, прогнати keyword-бейзлайн, з'ясувати, який із наявних
-LLM-каналів повертає logprobs, і віддати письмовий звіт із числами.
-Нічого в прод не вмикати. Жодного запису в бази проєкту.
+Стан нижче звірено з комітами серверної сесії 20–21.09.2026 у гілці
+`claude/fervent-shannon-lz9k6j`. Нічого в прод не вмикати. Жодного запису
+в бази проєкту.
 
 ## Межі
 
 - Читання: `~/.edrsr/edrsr.db`, `~/.edrsr/positions.db`, `~/laws_src/dep_gold.json`,
-  дамп відкинутих речень екстрактора, якщо він є, `~/dag_pilot_state/slice.jsonl`,
-  `/srv/work/sweep/*-classified.jsonl`. Усі бази відкривати лише `mode=ro`.
+  дампи відкинутих речень `~/.edrsr/dep_rejects.jsonl` і `dep_g_rejects.jsonl`,
+  `~/dag_pilot_state/slice.jsonl`, `/srv/work/sweep/*-classified.jsonl`.
+  Усі бази відкривати лише `mode=ro`.
 - Запис: тільки в `/srv/work/judge/` і в клон репозиторію `vlc-ua`.
 - Ключі провайдерів живуть у `~/.secrets/<провайдер>.env`; експортувати у
   змінну оточення на час команди, ніколи не копіювати в репозиторій чи звіт.
-- Матеріали клієнтських справ у цю роботу не входять: еталон атрибуції
-  будується лише з публічних текстів ЄДРСР.
+- Файл, що залишає сервер (Kaggle), проходить `vlc-judge scrub-gold`; у звіт
+  іде кількість замін і контрольні лічильники, що не змінилися.
 - Важкі прогони по прод-базі не в робочі години Павла.
 
-## Крок 1. Репозиторій і пакет
+## Що вже зроблено (20–21.09.2026, серверна сесія)
+
+| Крок | Стан | Де лежить |
+|---|---|---|
+| Пакет встановлено, тести | зроблено | `/srv/work/judge/vlc-ua` |
+| Схема edrsr.db | `documents(full_text, judgment_code→judgment_forms, adjudication_date)`; добір за `rowid DESC` через `idx_doc_filter`, бо індексу на дату немає | `gold/attribution.py:read_sqlite_texts` |
+| Еталон атрибуції | v5: 1 909 постанов, 10 156 рядків; п'ять ітерацій лексикону заголовків, контроль читанням 27/30 | `/srv/work/judge/attribution.jsonl` |
+| Знеособлення перед вивантаженням | `scrub-gold`: імена, ініціали з прізвищем, коди; номери справ, дати, суми, ОСОБА_N не змінені | `gold/scrub.py` |
+| Голова атрибуції | навчена на Kaggle T4 (fp16, заморожені ембеддинги, listwise), ONNX-експорт | `/srv/work/judge/heads/…` |
+| Holdout | окремий зріз через `--skip`, 2 894 рядки, оцінка через torch на GPU | `reports/…` |
+| Розбір програшів голови | 76 рядків проти keyword; шість найупевненіших виявились помилками еталона, лексикон виправлено | коміти c78e63e, 6bab067 |
+| Еталон відступів | будується з `--evidence`: мітка з самого речення; 23/26 проти 14/26 у вихідних міток | `gold/departures.py:evidence_label` |
+| Канали logprobs | Groq і Cohere відмовляють параметр, працюють як one-hot учителі; проба це показує | `probe.py`, `backends/logprob.py` |
+
+Числа точності, ECE, порогів і покриття брати лише з файлів у
+`/srv/work/judge/reports/`, не з пам'яті сесії.
+
+## Крок 1. Оновити пакет
 
 ```bash
-mkdir -p /srv/work/judge && cd /srv/work/judge
-git clone --branch claude/fervent-shannon-lz9k6j https://github.com/pavlozakharov/vlc-ua.git \
-  || git -C vlc-ua pull
-~/.edrsr/venv/bin/pip install -e ./vlc-ua
-~/.edrsr/venv/bin/vlc-judge task attribution > attribution.task.json
-~/.edrsr/venv/bin/vlc-judge task departure_pair > departure_pair.task.json
+cd /srv/work/judge && git -C vlc-ua pull
+~/.edrsr/venv/bin/pip install -q -e ./vlc-ua
 ~/.edrsr/venv/bin/python -m pytest -q vlc-ua/tests
 ```
 
-Далі `vlc-judge` означає `~/.edrsr/venv/bin/vlc-judge`.
+Далі `vlc-judge` означає `~/.edrsr/venv/bin/vlc-judge`, робоча тека `/srv/work/judge`.
 
-## Крок 2. Схема edrsr.db
+## Крок 2. Перезбірка еталона після правок лексикону
 
-`gold/attribution.py:read_sqlite_texts` припускає таблицю з колонками
-`doc_id`, `text`, `judgment`, `date`. Спершу перевірити:
-
-```bash
-sqlite3 "file:$HOME/.edrsr/edrsr.db?mode=ro" ".tables"
-sqlite3 "file:$HOME/.edrsr/edrsr.db?mode=ro" ".schema documents"
-```
-
-Якщо таблиця або колонки називаються інакше, змінити SQL у
-`read_sqlite_texts` у клоні і записати у звіт, що саме змінено. Повний
-текст постанови може лежати в іншій таблиці, ніж картка; брати той стовпець,
-який містить повний текст рішення ВС, а не конспект.
-
-## Крок 3. Еталон атрибуції
+Після кожної правки `HEADER_RULES` еталон і holdout перезбираються тим самим
+кодом, інакше голова навчається на одному, а міряється на іншому:
 
 ```bash
 vlc-judge gold-attribution --texts ~/.edrsr/edrsr.db --limit 2000 --per-doc 6 \
   --out attribution.jsonl
+vlc-judge gold-attribution --texts ~/.edrsr/edrsr.db --skip 3000 --limit 600 --per-doc 6 \
+  --out attribution-holdout.jsonl
+vlc-judge scrub-gold --in attribution.jsonl --out attribution.scrubbed.jsonl
+vlc-judge scrub-gold --in attribution-holdout.jsonl --out attribution-holdout.scrubbed.jsonl
 ```
 
-Команда друкує кількість фрагментів за видами: court, party, lower, facts,
-procedural. Очікується кілька тисяч рядків. Якщо якогось виду менше сотні,
-перевірити на десяти випадкових рішеннях, чи впізнає лексикон заголовків
-у `gold/attribution.py:HEADER_RULES` реальні заголовки, і доповнити його,
-записавши у звіт кожен доданий шаблон.
+Версію еталона фіксувати у назві теки звіту (`reports/v6/…`), щоб числа
+різних версій не змішувались. Контроль читанням: 30 випадкових рядків нової
+версії, розбіжність ярлика із заголовком це дефект лексикону.
 
-Контроль якості ярликів, обов'язковий: 30 випадкових рядків прочитати
-очима і записати в `attribution.adjudication.jsonl` рядки виду
-`{"id": "...", "gold": "court", "draw": "random"}`. Розбіжність ярлика із
-заголовком означає дефект лексикону, а не дефект моделі.
-
-## Крок 4. Еталон відступів
-
-```bash
-vlc-judge gold-departures \
-  --dep-gold ~/laws_src/dep_gold.json \
-  --positions-db ~/.edrsr/positions.db --limit 3000 \
-  --rejects <шлях до дампу DUMP_REJECTS, якщо є> \
-  --out departures.jsonl
-```
-
-Джерела і їхня довіра записані в кожному рядку в полі `source`: `lpd` це
-офіційна розмітка ВС, `grammar` це регекс-шар із заміряною точністю 87–88 %,
-`grammar-reject:<кошик>` це негативи з кошиків «заперечення» і «генерика».
-Питання ставиться на пару «речення + одна ціль»: одне речення законно
-перелічує кілька справ, і верифікатор на ціле речення якорить на першій.
-
-## Крок 5. Keyword-бейзлайн
+## Крок 3. Бейзлайн і голова на holdout
 
 ```bash
 vlc-judge run --backend keyword --task attribution.task.json \
-  --gold attribution.jsonl --out runs/kw-attribution.json
-vlc-judge report runs/kw-attribution.json --task attribution.task.json \
-  --gold attribution.jsonl > reports/kw-attribution.json
+  --gold attribution-holdout.jsonl --out runs/v6/kw-holdout.json
+vlc-judge run --backend crossencoder --runtime onnx --model-dir heads/<остання голова> \
+  --task attribution.task.json --gold attribution-holdout.jsonl --out runs/v6/ce-holdout.json
+vlc-judge report runs/v6/ce-holdout.json --task attribution.task.json \
+  --gold attribution-holdout.jsonl --baseline runs/v6/kw-holdout.json > reports/v6/ce-holdout.json
+```
 
+На CPU через ONNX holdout на 2 894 рядки займає години; якщо є GPU-сесія,
+`--runtime torch` там, де стоїть torch. Правило допуску голови незмінне:
+точність вища за keyword, ECE не більше 0,05, покриття при порозі 0,95 не
+нижче за бейзлайн, програші прочитані очима.
+
+## Крок 4. Еталон відступів і бейзлайн
+
+```bash
+vlc-judge gold-departures --evidence \
+  --dep-gold ~/laws_src/dep_gold.json \
+  --positions-db ~/.edrsr/positions.db --limit 3000 \
+  --rejects ~/.edrsr/dep_rejects.jsonl \
+  --out departures.jsonl
 vlc-judge run --backend keyword --task departure_pair.task.json \
-  --gold departures.jsonl --out runs/kw-departures.json
-vlc-judge report runs/kw-departures.json --task departure_pair.task.json \
-  --gold departures.jsonl > reports/kw-departures.json
+  --gold departures.jsonl --out runs/v6/kw-departures.json
+vlc-judge report runs/v6/kw-departures.json --task departure_pair.task.json \
+  --gold departures.jsonl > reports/v6/kw-departures.json
 ```
 
-Бейзлайн існує, щоб було з чим порівнювати: голова, яка не б'є регекс на
-випадковому зрізі, у прод не йде.
+Без `--evidence` мітки успадковують три відомі дефекти джерел, вони описані
+в докстрінгу `evidence_label`. Адьюдикація 30 випадкових пар читанням, файл
+`departures.adjudication.jsonl` з полем `draw: random`, потім перезбірка з
+`--adjudication`.
 
-## Крок 6. Проба logprobs на наявних каналах
+## Крок 5. jev як точка порівняння і учитель
 
-Проба одним запитом показує, чи віддає канал справжній розподіл, чи лише
-текст. Канали і ключі за вікі проєкту:
-
-```bash
-set -a; . ~/.secrets/groq.env; set +a
-LLM_API_KEY="$GROQ_API_KEY" vlc-judge probe-logprobs \
-  --base-url https://api.groq.com/openai/v1 --model llama-3.3-70b-versatile
-
-set -a; . ~/.secrets/openrouter.env; set +a
-LLM_API_KEY="$OPENROUTER_API_KEY" vlc-judge probe-logprobs \
-  --base-url https://openrouter.ai/api/v1 --model nvidia/nemotron-3-super-120b:free
-
-set -a; . ~/.secrets/mistral.env; set +a
-LLM_API_KEY="$MISTRAL_API_KEY" vlc-judge probe-logprobs \
-  --base-url https://api.mistral.ai/v1 --model mistral-small-latest
-```
-
-Так само спробувати GLM і Cloudflare Workers AI через їхні
-OpenAI-сумісні адреси, якщо ключі є. У звіт заносити рядок `verdict`
-кожної проби. Канал із `"logprobs": true` придатний для logprob-бекенду;
-канал з `degraded` годиться лише як одноточковий учитель для розмітки.
-
-Якщо хоч один канал повертає logprobs, прогнати його на еталоні атрибуції
-з обмеженням, щоб не з'їсти добову квоту:
-
-```bash
-LLM_API_KEY=... vlc-judge run --backend logprob --base-url <url> --model <model> \
-  --task attribution.task.json --gold attribution.jsonl --limit 500 \
-  --out runs/logprob-attribution.json
-vlc-judge report runs/logprob-attribution.json --task attribution.task.json \
-  --gold attribution.jsonl --baseline runs/kw-attribution.json > reports/logprob-attribution.json
-```
-
-Вичерпана квота або 429 з'являються у звіті як `failures`, це окремий клас
-результату; документ із таким статусом не отримує вердикту.
-
-## Крок 6-а. Необов'язково: jev як точка порівняння і учитель
-
-Якщо є ключ TypeSafe у `~/.secrets/typesafe.env` (реєстрація самостійна на
-console.typesafe.ai; ключ ніколи не копіювати в репозиторій чи звіт):
+Ключ у `~/.secrets/typesafe.env`; якщо його ще нема, `bash vlc-ua/docs/wiki/apply-typesafe.sh`
+спитає його з термінала і заодно поставить нотатку у вікі.
 
 ```bash
 set -a; . ~/.secrets/typesafe.env; set +a
 vlc-judge run --backend typesafe --model jev-1.13.0 --task attribution.task.json \
-  --gold attribution.jsonl --limit 500 --out runs/jev-attribution.json
-vlc-judge report runs/jev-attribution.json --task attribution.task.json \
-  --gold attribution.jsonl --baseline runs/kw-attribution.json > reports/jev-attribution.json
+  --gold attribution-holdout.jsonl --limit 5 --out runs/v6/jev-probe.json --cache .judge-cache-jev
+head -c 800 runs/v6/jev-probe.json
+vlc-judge run --backend typesafe --model jev-1.13.0 --task attribution.task.json \
+  --gold attribution-holdout.jsonl --limit 500 --out runs/v6/jev-holdout.json --cache .judge-cache-jev
+vlc-judge report runs/v6/jev-holdout.json --task attribution.task.json \
+  --gold attribution-holdout.jsonl --baseline runs/v6/kw-holdout.json > reports/v6/jev-holdout.json
 ```
 
-Лише публічні тексти ЄДРСР; версію моделі пінити, не використовувати
-алiас `jev-latest`. У звіт іде точність, ECE, поріг і wins/losses проти
-keyword-бейзлайну: це перший замір jev на українському юридичному тексті.
+Проба на п'яти рядках показує, чи прийнято ім'я `jev-1.13.0` і чи є
+`confidence` у відповіді; заголовок `X-Zero-Data-Retention` бекенд шле, назву
+в документації не звірено, тож ZDR вмикати ще й у консолі. Лише публічні
+тексти ЄДРСР. Той самий прогін на `departures.jsonl` із задачею
+`departure_pair`. Після прогону ключ перевипустити: він побував у чаті.
 
-## Крок 7. Звіт
+## Крок 6. Звіт
 
-Файл `/srv/work/judge/REPORT.md`, українською, без оцінок «добре/погано»,
-лише числа з посиланнями на файли звітів:
+Файл `/srv/work/judge/REPORT.md`, українською, без оцінок, лише числа з
+посиланнями на файли звітів:
 
-1. Схема edrsr.db і що змінено в SQL.
-2. Еталон атрибуції: рядків за видами; скільки з 30 прочитаних очима
-   збіглися з ярликом заголовка.
-3. Еталон відступів: рядків за `source` і за ярликом.
-4. Для кожного прогону: `random.accuracy`, `random.ece`, `random.threshold`
-   (поріг, покриття, досягнута точність), `latency_s`, `n_failures`,
-   для logprob ще `vs_baseline.wins/losses`.
-5. Результати проб logprobs по каналах.
-6. Що не вдалося і чому, окремим списком.
+1. Версія еталона, рядків за видами, контроль читанням.
+2. Holdout: keyword, голова, jev, кожен з `random.accuracy`, `random.ece`,
+   `random.threshold`, `latency_s`, `n_failures`, `vs_baseline`.
+3. Відступи: рядків за `source` і ярликом, бейзлайн, jev.
+4. Проби каналів logprobs.
+5. Що не вдалося і чому, окремим списком.
 
-Після звіту: `git add` еталонів не робити, вони лишаються у `/srv/work/judge/`;
-у репозиторій комітити лише правки коду з поясненням у повідомленні коміту.
+Еталони в git не додавати, вони лишаються у `/srv/work/judge/`; у репозиторій
+комітити лише правки коду з поясненням у повідомленні коміту.

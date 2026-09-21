@@ -66,6 +66,10 @@ vlc-judge run --backend crossencoder --model-dir heads/attribution \
 vlc-judge report runs/crossencoder.json --task gold/attribution.task.json \
   --gold gold/attribution.jsonl --baseline runs/keyword.json
 vlc-judge serve --backend crossencoder --model-dir heads/attribution --port 8009
+vlc-judge gold-attribution --texts edrsr.db --skip 3000 --limit 600 --out gold/holdout.jsonl   # holdout з невидимих рішень
+vlc-judge gold-departures --evidence --dep-gold dep_gold.json --positions-db positions.db --out gold/departures.jsonl
+vlc-judge scrub-gold --in gold/attribution.jsonl --out gold/attribution.scrubbed.jsonl     # перед вивантаженням
+vlc-judge run --backend crossencoder --runtime torch ...                                    # оцінка на GPU
 ```
 
 Звіт (JSON) розділяє, що правила не дозволяють змішувати:

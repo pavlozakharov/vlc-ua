@@ -6,65 +6,86 @@
 вже працює у проді як реранкер в ONNX int8 на CPU, тому подача голови на
 сервер не потребує GPU.
 
+Перший прогін 20.09.2026 упав з CUDA OOM: 559M параметрів у fp32 з AdamW не
+вміщуються в T4. Прапорці нижче це наслідок того замiру, не побажання.
+
 ## Крок 1. Дані
 
-Створити Kaggle Dataset `vlc-gold` з двох файлів, зібраних на сервері за
-`docs/HANDOFF-server.md`:
-
-- `attribution.jsonl` з рядками `sample` random і enriched;
-- `attribution.task.json`.
-
-Персональних даних у фрагментах постанов ВС уникати: ПІБ фізосіб перед
-викладенням вичистити тим самим знеособлювачем, що в проєкті.
-
-## Крок 2. Ядро кернела
-
-Кернел з прискорювачем `NvidiaTeslaT4`. Комірки:
+На сервері, перед вивантаженням, обов'язково знеособити:
 
 ```bash
-pip install -q "transformers>=4.40" onnxruntime
+vlc-judge scrub-gold --in attribution.jsonl --out attribution.scrubbed.jsonl
+```
+
+Скрипт замінює повні імена, ініціали з прізвищем і коди; номери справ,
+дати, суми, «Велика Палата» і ОСОБА_N лишаються, і це перевіряється
+лічильниками. Створити Kaggle Dataset `vlc-gold` з файлів
+`attribution.scrubbed.jsonl` і `attribution.task.json`.
+
+## Крок 2. Кернел
+
+Прискорювач `NvidiaTeslaT4`. Комірки:
+
+```bash
+pip install -q "transformers>=4.40" onnxruntime onnxscript
 git clone --branch claude/fervent-shannon-lz9k6j https://github.com/pavlozakharov/vlc-ua.git /kaggle/working/vlc-ua
 pip install -q -e /kaggle/working/vlc-ua
 ```
 
 ```bash
 cd /kaggle/working && python -m vlc_ua.judge.train.crossencoder \
-  --gold /kaggle/input/vlc-gold/attribution.jsonl \
+  --gold /kaggle/input/vlc-gold/attribution.scrubbed.jsonl \
   --task /kaggle/input/vlc-gold/attribution.task.json \
   --base BAAI/bge-reranker-v2-m3 \
   --out /kaggle/working/head-attribution \
-  --epochs 2 --lr 2e-5 --batch-rows 4 --max-length 1024 --dev-share 0.3 \
+  --epochs 2 --lr 2e-5 --batch-rows 4 --dev-share 0.3 \
+  --freeze-embeddings --grad-checkpointing --max-hours 10 \
   --export-onnx
 ```
 
-Пам'ять T4 на 16 ГБ: пачка з 4 рядків по 5 варіантів при довжині 1024
-проходить; при OOM зменшити `--batch-rows` до 2 або `--max-length` до 768.
-Довгі фрагменти обрізаються токенізатором, еталон будує їх до 1200 знаків.
+Що означають прапорці:
 
-Що робить скрипт: розбиває кожен рядок на пари «інструкція + значення
-варіанта» проти «стан», навчає listwise-крос-ентропією по варіантах рядка,
-відкладає 30 % випадкових рядків, на них підбирає температуру на кожне
-питання і пише метрики. Збагачені рядки навчають, але ніколи не калібрують.
+- `--max-length` за замовчуванням 512: найдовша пара «запит + фрагмент» в
+  еталоні 422 токени, 1024 лише подвоїла б паддинг.
+- fp16 увімкнено за замовчуванням (`--no-fp16` вимикає): без тензорних ядер
+  T4 не встигає за 12 годин.
+- `--freeze-embeddings`: матриця ембеддингів це 256M із 559M параметрів,
+  реранкерній голові її перенавчати нема чого; звільняє близько 3,6 ГБ.
+- `--grad-checkpointing`: решта пам'яті. Разом із заморозкою скрипт вмикає
+  `enable_input_require_grads`, інакше крок проходить, а ваги не рухаються;
+  тест `test_server_fixes.py` це перевіряє.
+- `--max-hours`: зупинка за бюджетом із калібруванням і записом `head.json`;
+  кернел, убитий на стіні 12 годин, не лишає нічого.
+- `--limit-rows N` для швидкої проби перед повним прогоном.
 
-## Крок 3. Що в результаті
+Скрипт розбиває кожен рядок на пари «інструкція + значення варіанта» проти
+«стан», навчає listwise-крос-ентропією одним forward на пачку, відкладає
+30 % випадкових рядків, на них підбирає температуру і пише метрики.
+Збагачені рядки навчають, але не калібрують.
+
+## Крок 3. Результат
 
 Тека `head-attribution/`: ваги, токенізатор, `model.onnx`, `tokenizer.json`,
-`head.json`:
+`head.json` із `temperatures`, `dev_metrics` і блоком `train` (рядки, епохи,
+lr, fp16, заморозка, години, чи зупинив бюджет). Якщо експорт ONNX упав через
+відсутній `onnxscript`, ваги і `head.json` уже на диску; доекспортувати
+можна пізніше, у тій самій теці.
 
-```json
-{"base": "BAAI/bge-reranker-v2-m3", "task": "attribution.task.json",
- "temperatures": {"attribution": 1.2},
- "dev_metrics": {"attribution": {"n_dev": 300, "accuracy": 0.9, "ece": 0.03,
-                                  "ece_uncalibrated": 0.08, "temperature": 1.2}},
- "max_length": 1024}
-```
-
-Числа тут ілюстративні. Квантування для CPU, у тому ж кернелі:
+Квантування для CPU у тому ж кернелі:
 
 ```python
 from onnxruntime.quantization import quantize_dynamic, QuantType
 quantize_dynamic("/kaggle/working/head-attribution/model.onnx",
                  "/kaggle/working/head-attribution/model.onnx", weight_type=QuantType.QInt8)
+```
+
+Holdout можна поміряти прямо в кернелі на GPU тим самим харнесом, без
+власного циклу оцінки:
+
+```bash
+vlc-judge run --backend crossencoder --runtime torch --model-dir /kaggle/working/head-attribution \
+  --task /kaggle/input/vlc-gold/attribution.task.json \
+  --gold /kaggle/input/vlc-gold/attribution-holdout.scrubbed.jsonl --out runs/ce-holdout.json
 ```
 
 Зберегти версію кернела; результат забрати CLI, як у проєктному рунбуку
@@ -74,29 +95,28 @@ Kaggle: `kaggle kernels output <user>/<kernel> -p /srv/work/judge/heads/`.
 
 ```bash
 ~/.edrsr/venv/bin/pip install -q onnxruntime tokenizers
-vlc-judge run --backend crossencoder --model-dir /srv/work/judge/heads/head-attribution \
-  --task attribution.task.json --gold attribution.jsonl --out runs/ce-attribution.json
-vlc-judge report runs/ce-attribution.json --task attribution.task.json \
-  --gold attribution.jsonl --baseline runs/kw-attribution.json > reports/ce-attribution.json
+vlc-judge run --backend crossencoder --runtime onnx --model-dir /srv/work/judge/heads/head-attribution \
+  --task attribution.task.json --gold attribution-holdout.jsonl --out runs/ce-holdout.json
+vlc-judge report runs/ce-holdout.json --task attribution.task.json \
+  --gold attribution-holdout.jsonl --baseline runs/kw-holdout.json > reports/ce-holdout.json
 ```
 
-Звіт рахує метрики на тестовій половині випадкового зрізу з температурою,
-підібраною на dev-половині, тобто на рядках, яких навчання не бачило лише
-в частині dev. Чесніше мати окремий еталон, зібраний після навчання, з
-рішень, яких не було в навчальному наборі; для цього на сервері зібрати
-`attribution-holdout.jsonl` з іншого діапазону дат і звітувати саме по ньому.
+Holdout будується командою `gold-attribution --skip N` з рішень, яких
+навчальний зріз не бачив; це і є чесний замір, dev-половина в `head.json`
+лише орієнтир.
 
 ## Крок 5. Правило допуску
 
 Голова ставиться поруч із евристикою verify_quote як «ознака, не вердикт»
-лише якщо на випадковому зрізі одночасно:
+лише якщо на holdout одночасно:
 
 1. точність вища за keyword-бейзлайн і `vs_baseline.losses` розібрані очима;
+   якщо розбір показує помилки еталона, спочатку лексикон, потім перезбірка
+   і повторне навчання, так уже було 21.09;
 2. `random.ece` не більше 0,05;
 3. покриття при порозі на точність 0,95 не нижче за бейзлайн.
 
-Інакше голова не вмикається: більше еталона, перевірка лексикону
-заголовків, інші гіперпараметри. Сервінг після допуску:
+Сервінг після допуску:
 
 ```bash
 vlc-judge serve --backend crossencoder --model-dir /srv/work/judge/heads/head-attribution --port 8009
