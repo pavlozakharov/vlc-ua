@@ -126,7 +126,8 @@ class TestTrainingStepActuallyLearns:
 
     def _tiny(self, tmp_path, **flags):
         import json
-        import torch
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("transformers")
         from transformers import AutoTokenizer, XLMRobertaConfig, XLMRobertaForSequenceClassification
         from vlc_ua.judge.train import crossencoder as ce
 
