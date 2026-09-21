@@ -72,7 +72,20 @@ def make_keyword_judge(question_name: str, base: float = 0.1, hit: float = 1.5) 
     """A ScoringJudge whose scores count regex hits per option.
 
     Options with no rules (``other``, ``mention``) get ``base``: they win only
-    when nothing else fires, which is exactly the semantics of a fallback.
+    when nothing else fires, which is exactly the semantics of a fallback. An
+    option that HAS rules and matches none of them scores zero, so the
+    fallback actually wins that tie. It did not until 21.09.2026: a missing
+    rule scored ``base`` too, the fallback tied with everything, and argmax
+    fell back to whichever option the task file happened to list first.
+
+    What that silently bought, measured the same day: on the attribution
+    holdout no rule fires at all in 1 964 of 3 001 rows (65.4%), and the first
+    listed option there is ``court``, the majority class of exactly those rows
+    (720). Attribution has no fallback option, so this fix does not move its
+    baseline — but read its 0.468 knowing that two thirds of it is the order
+    of keys in a JSON file, not a rule. On ``departure_pair`` nothing fires in
+    352 of 2 070 rows and the first option is ``departure`` while 272 of them
+    are really ``refusal``; there the fallback now takes the tie, as written.
     """
     rules = RULES[question_name]
     compiled = {opt: [re.compile(p, re.I) for p in pats] for opt, pats in rules.items()}
@@ -83,6 +96,6 @@ def make_keyword_judge(question_name: str, base: float = 0.1, hit: float = 1.5) 
         if not pats:
             return base if option in rules else 0.0
         hits = sum(1 for rx in pats if rx.search(text))
-        return base + hit * hits
+        return base + hit * hits if hits else 0.0
 
     return ScoringJudge(score, name=f"keyword:{question_name}")

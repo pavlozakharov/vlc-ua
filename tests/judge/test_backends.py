@@ -361,3 +361,63 @@ class TestExternalJudge:
 
         # Confidence should be recomputed, not taken from wire
         assert answers["q"].confidence > 0.5
+
+
+class TestKeywordFallbackWinsTheTie:
+    """The docstring promised it; until 21.09.2026 the code did not do it."""
+
+    def test_fallback_option_wins_when_no_rule_fires(self):
+        from vlc_ua.judge.backends.keyword import make_keyword_judge
+        from vlc_ua.judge.evalharness import load_task
+
+        judge = make_keyword_judge("departure_pair")
+        task = load_task("/srv/work/judge/departure_pair.task.json")
+        state = {"sentence": "Текст без жодної ознаки відступу.", "target_case": "1/2/20"}
+
+        ans = judge.ask(state, task)["departure_pair"]
+        top = max(ans.probabilities, key=ans.probabilities.__getitem__)
+
+        assert top == "other"
+
+    def test_a_firing_rule_still_beats_the_fallback(self):
+        from vlc_ua.judge.backends.keyword import make_keyword_judge
+        from vlc_ua.judge.evalharness import load_task
+
+        judge = make_keyword_judge("departure_pair")
+        task = load_task("/srv/work/judge/departure_pair.task.json")
+        state = {"sentence": "Велика Палата відступила від висновку у справі № 1/2/20.",
+                 "target_case": "1/2/20"}
+
+        ans = judge.ask(state, task)["departure_pair"]
+
+        assert max(ans.probabilities, key=ans.probabilities.__getitem__) == "departure"
+
+
+class TestOnnxThreadBudget:
+    """Free speed measured 21.09.2026: 6 threads 6.03 s/question against
+    9.99 s when onnxruntime helps itself to all eight, identical logits."""
+
+    def test_leaves_two_cores_to_the_machine(self, monkeypatch):
+        from vlc_ua.judge.backends import crossencoder as ce
+
+        monkeypatch.delenv("VLC_JUDGE_ONNX_THREADS", raising=False)
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+
+        assert ce.onnx_threads() == 6
+
+    def test_env_overrides_and_zero_means_let_ort_decide(self, monkeypatch):
+        from vlc_ua.judge.backends import crossencoder as ce
+
+        monkeypatch.setenv("VLC_JUDGE_ONNX_THREADS", "3")
+        assert ce.onnx_threads() == 3
+
+        monkeypatch.setenv("VLC_JUDGE_ONNX_THREADS", "0")
+        assert ce.onnx_threads() == 0
+
+    def test_never_asks_for_zero_cores_on_a_tiny_box(self, monkeypatch):
+        from vlc_ua.judge.backends import crossencoder as ce
+
+        monkeypatch.delenv("VLC_JUDGE_ONNX_THREADS", raising=False)
+        monkeypatch.setattr("os.cpu_count", lambda: 1)
+
+        assert ce.onnx_threads() == 1

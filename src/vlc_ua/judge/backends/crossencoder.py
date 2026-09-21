@@ -83,12 +83,42 @@ class CrossEncoderHead:
         return ScoringJudge(self.score, name=name, temperatures=temps)
 
 
+def onnx_threads() -> int:
+    """How many cores one ONNX session may use.
+
+    Left to itself onnxruntime takes every core, and on a box that is also
+    serving something else that is the WORST setting. Measured 21.09.2026 on
+    this 8-core EPYC under load, head ``head-attribution-v5``, 12 holdout
+    questions of 5 options each:
+
+        default 9.99 s · 2 threads 8.54 · 4 threads 6.35 ·
+        6 threads 6.03 · 8 threads 8.72   (seconds per question)
+
+    The logits do not move: max |Δlogit| across every setting was exactly
+    0.0, so this is free speed, not a trade — the same thing the embedder
+    measured on 2026-08-06 (cos(threads=1, threads=6) = 1.00000000). Leaving
+    two cores to the rest of the machine is what wins; taking all eight
+    thrashes. ``VLC_JUDGE_ONNX_THREADS`` overrides, 0 means "let ORT decide".
+    """
+    import os
+
+    env = os.environ.get("VLC_JUDGE_ONNX_THREADS")
+    if env is not None:
+        return max(0, int(env))
+    return max(1, (os.cpu_count() or 4) - 2)
+
+
 class _OnnxImpl:
     def __init__(self, model_dir: str, max_length: int) -> None:
         import onnxruntime as ort  # optional dependency
         from tokenizers import Tokenizer
 
-        self.sess = ort.InferenceSession(str(Path(model_dir) / "model.onnx"),
+        so = ort.SessionOptions()
+        threads = onnx_threads()
+        if threads:
+            so.intra_op_num_threads = threads
+            so.inter_op_num_threads = 1
+        self.sess = ort.InferenceSession(str(Path(model_dir) / "model.onnx"), so,
                                          providers=["CPUExecutionProvider"])
         self.tok = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
         self.tok.enable_truncation(max_length)
