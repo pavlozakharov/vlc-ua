@@ -91,19 +91,34 @@ class CrossEncoderHead:
 def onnx_threads() -> int:
     """How many cores one ONNX session may use.
 
-    Left to itself onnxruntime takes every core, and on a box that is also
-    serving something else that is the WORST setting. Measured 21.09.2026 on
-    this 8-core EPYC under load, head ``head-attribution-v5``, 12 holdout
-    questions of 5 options each:
+    THE SETTING ONLY MATTERS UNDER CONTENTION, and the first measurement of
+    it was taken under contention without saying so. Both rounds, same box
+    (8-core EPYC), same head, 5 options per question:
 
-        default 9.99 s · 2 threads 8.54 · 4 threads 6.35 ·
-        6 threads 6.03 · 8 threads 8.72   (seconds per question)
+        threads:        ORT default   2      4      6      8
+        under load      9.99 s      8.54   6.35   6.03   8.72   (1 run each)
+        machine idle    5.31/5.56   8.15   5.44   4.93   4.97   (2 rounds,
+                                                      order reversed in the 2nd)
 
-    The logits do not move: max |Δlogit| across every setting was exactly
-    0.0, so this is free speed, not a trade — the same thing the embedder
-    measured on 2026-08-06 (cos(threads=1, threads=6) = 1.00000000). Leaving
-    two cores to the rest of the machine is what wins; taking all eight
-    thrashes. ``VLC_JUDGE_ONNX_THREADS`` overrides, 0 means "let ORT decide".
+    Read the second row before believing the first. Idle, everything from 4
+    threads up is the same: the spread WITHIN a setting (6 threads gave 5.35
+    and 4.93) is as wide as the spread between settings, so "6 beats the
+    default by 1.66x" was an artefact of a machine that the measuring process
+    was itself loading. What survives both rounds is narrower and still
+    useful: 2 threads is genuinely slow, and letting ORT take every core is
+    the worst choice when anything else is running — 9.99 s against 6.03 s
+    there, no difference here.
+
+    The default stays at cores-2 because this box is normally busy — it
+    serves edrsr_mcp_v2 — so the contended row is the one that describes real
+    life. It is a defensive setting, not free speed.
+
+    What IS free: the logits do not move. Max |Δlogit| across every setting
+    in both rounds was exactly 0.0, the same thing the embedder measured on
+    2026-08-06 (cos(threads=1, threads=6) = 1.00000000). So the choice costs
+    nothing in answers whichever way it goes.
+
+    ``VLC_JUDGE_ONNX_THREADS`` overrides, 0 means "let ORT decide".
     """
     import os
 

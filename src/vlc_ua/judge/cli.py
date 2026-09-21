@@ -88,7 +88,8 @@ def cmd_run(args) -> None:
     gold = ev.load_gold(args.gold)
     backend = make_backend(args)
     res = ev.run(backend, task, gold, cache_dir=args.cache, task_version=args.task_version,
-                 limit=args.limit, accept_legacy_cache=args.accept_legacy_cache)
+                 limit=args.limit, accept_legacy_cache=args.accept_legacy_cache,
+                 concurrency=args.concurrency)
     payload = {"backend": res.backend, "task_version": res.task_version,
                "fingerprint": res.fingerprint,
                "answers": {k: a.as_dict() for k, a in res.answers.items()},
@@ -171,6 +172,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--gold", required=True); p.add_argument("--out", required=True)
     p.add_argument("--cache", default=".judge-cache"); p.add_argument("--task-version", default="v1")
     p.add_argument("--limit", type=int)
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="parallel requests, for REMOTE backends only: the loop waits on a "
+                        "socket, not on this machine. Leave at 1 for a local head")
     p.add_argument("--accept-legacy-cache", action="store_true",
                    help="read cache entries written before backends carried a fingerprint. "
                         "Only for resuming a run whose backend has not changed: such entries "

@@ -84,13 +84,27 @@ class RunResult:
 
 def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str, Any]],
         cache_dir: str | Path | None = ".judge-cache", task_version: str = "v1",
-        limit: int | None = None, accept_legacy_cache: bool = False) -> RunResult:
+        limit: int | None = None, accept_legacy_cache: bool = False,
+        concurrency: int = 1) -> RunResult:
     """Ask the backend every gold item's question; cache raw answers on disk.
 
     ``accept_legacy_cache`` reads entries written before backends carried a
     fingerprint. It is an explicit escape hatch for resuming a long run whose
     backend demonstrably has not changed, never a default: the whole point of
     the fingerprint is that such entries cannot be told apart otherwise.
+
+    ``concurrency`` is for REMOTE backends, where the loop spends its life
+    waiting on a socket. Measured against TypeSafe jev on 21.09.2026, per
+    request latency flat at every level and no refusals:
+
+        1 thread   1.5 rows/s      8 threads  11.5 rows/s
+        4 threads  5.6 rows/s     32 threads  24.9 rows/s
+
+    which turns the 3 001-row holdout from half an hour into two minutes.
+    Leave it at 1 for a local head: the ONNX session already spreads one
+    forward pass across the cores, and competing sessions only thrash. The
+    per-request timings stay honest either way — each row is timed around its
+    own call, not around the batch.
     """
     res = RunResult(backend=getattr(backend, "name", backend.__class__.__name__),
                     task_version=task_version)
@@ -99,34 +113,51 @@ def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str
     cache = Path(cache_dir) if cache_dir else None
     if cache:
         cache.mkdir(parents=True, exist_ok=True)
-    for n, row in enumerate(gold):
-        if limit is not None and n >= limit:
-            break
-        qn = row["question"]
-        q = task[qn]
-        key = _item_key(res.backend, task_version, row, fingerprint)
-        cpath = cache / f"{key}.json" if cache else None
-        if cache and accept_legacy_cache and not cpath.exists():
+    rows = list(gold)[:limit] if limit is not None else list(gold)
+
+    def cache_path(row):
+        if not cache:
+            return None
+        cpath = cache / f"{_item_key(res.backend, task_version, row, fingerprint)}.json"
+        if accept_legacy_cache and not cpath.exists():
             legacy = cache / f"{_item_key(res.backend, task_version, row)}.json"
             if legacy.exists():
-                cpath = legacy
+                return legacy
+        return cpath
+
+    def ask_one(row):
+        """-> (id, answer|None, seconds, failure|None). Pure per row, so the
+        only shared state is the dicts the caller fills in one thread."""
+        qn = row["question"]
+        q = task[qn]
+        cpath = cache_path(row)
         if cpath and cpath.exists():
             d = json.loads(cpath.read_text(encoding="utf-8"))
-            res.answers[row["id"]] = Answer.from_probs(q, d["probabilities"])
-            res.seconds[row["id"]] = d.get("seconds", 0.0)
-            continue
+            return row["id"], Answer.from_probs(q, d["probabilities"]), d.get("seconds", 0.0), None
         t0 = time.time()
         try:
             ans = backend.ask(row["state"], {qn: q})[qn]
         except Exception as exc:  # provider quota, network, malformed: a separate class
-            res.failures[row["id"]] = f"{type(exc).__name__}: {exc}"[:300]
-            continue
+            return row["id"], None, time.time() - t0, f"{type(exc).__name__}: {exc}"[:300]
         dt = time.time() - t0
-        res.answers[row["id"]] = ans
-        res.seconds[row["id"]] = dt
         if cpath:
             cpath.write_text(json.dumps({"probabilities": ans.probabilities, "seconds": dt},
                                         ensure_ascii=False), encoding="utf-8")
+        return row["id"], ans, dt, None
+
+    if concurrency > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            out = list(pool.map(ask_one, rows))
+    else:
+        out = [ask_one(row) for row in rows]
+
+    for rid, ans, dt, failure in out:
+        if failure is not None:
+            res.failures[rid] = failure
+            continue
+        res.answers[rid] = ans
+        res.seconds[rid] = dt
     return res
 
 
