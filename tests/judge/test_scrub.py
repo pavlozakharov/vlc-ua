@@ -84,3 +84,16 @@ class TestGluedPatronymic:
                      "Касаційний господарський суд"):
             out, n = scrub_text(keep)
             assert out == keep and n == 0, out
+
+
+class TestInitialsWithoutSecondDot:
+    """«О.В Білоус» — друга ініціала без крапки; знайдено перевіркою перед
+    вивантаженням збірки v5: один такий підпис на 10 156 рядків."""
+
+    def test_second_initial_without_dot(self):
+        out, n = scrub_text("Судді: О.В Білоус")
+        assert "Білоус" not in out and n == 1
+
+    def test_article_reference_is_not_a_name(self):
+        out, n = scrub_text("стаття 5 ЦК України")
+        assert n == 0 and out == "стаття 5 ЦК України"
