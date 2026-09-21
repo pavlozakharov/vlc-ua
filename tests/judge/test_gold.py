@@ -188,6 +188,18 @@ class TestHeaderKindVariants:
         assert gold_attr.header_kind("Позиція учасників справи") == "party"
         assert gold_attr.header_kind("5. Позиція іншого учасника справи") == "party"
 
+    def test_forms_found_by_the_v3_read_control(self):
+        """Чотири зразки, кожен порахований у корпусі 21.09.2026."""
+        assert gold_attr.header_kind("Аргументи інших учасників справи") == "party"          # 35
+        assert gold_attr.header_kind("3. ВСТАНОВЛЕНІ СУДАМИ ПОПЕРЕДНІХ ІНСТАНЦІЙ "
+                                     "ОБСТАВИНИ У СПРАВІ") == "facts"                        # 33
+        assert gold_attr.header_kind("Рух касаційної скарги та матеріалів справи") == "procedural"  # 112
+        assert gold_attr.header_kind("10. Судові витрати") == "procedural"                   # 273
+
+    def test_bare_costs_header_does_not_swallow_a_sentence(self):
+        """«Судові витрати» ловиться лише як цілий рядок-заголовок."""
+        assert gold_attr.header_kind("Судові витрати стягуються з відповідача") is None
+
 
 class TestDeparturesFromDepGold:
     """Test departure pair gold building."""
