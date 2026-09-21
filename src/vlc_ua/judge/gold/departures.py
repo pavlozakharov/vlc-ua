@@ -156,16 +156,28 @@ def from_dep_gold(path: str | Path) -> Iterator[dict]:
             continue
         for c in cases:
             if c in quote:
+                # ``sample="enriched"``, not "random": the LPD markup is a
+                # curated collection of departures, so a threshold or an ECE
+                # fitted on it would be fitted on positives only. The random
+                # slice is built by drawing rows and reading them
+                # (``merge_adjudications`` with ``"draw": "random"``), never
+                # by relabelling a curated source.
                 yield _row(f"lpd:{p.get('lpd_id')}:{c}", {"sentence": quote, "target_case": c,
                                                            "citing_case": ev.get("cause_num")},
-                           "departure_pair", "departure", "random", "lpd")
+                           "departure_pair", "departure", "enriched", "lpd")
 
 
 def merge_adjudications(rows: Iterable[dict], adjudication_path: str | Path | None) -> Iterator[dict]:
     """Overlay human verdicts: ``{"id": ..., "gold": ...}`` per line.
 
-    Adjudicated rows become ``sample="random"`` and ``source="human"`` only if
-    the adjudication file says they were drawn at random (``"draw": "random"``).
+    Adjudicated rows become ``sample="random"`` only if the adjudication file
+    says they were drawn at random (``"draw": "random"``).
+
+    The verdict's provenance is carried by the optional ``"by"`` field and
+    written into ``source`` verbatim. It defaults to ``"human"``, but a file
+    produced by anything other than a person reading the sentence must say so
+    (``"by": "model-2of2"``): a gold row that claims a human read it, when
+    none did, is the one defect no later measurement can detect.
     """
     adj: dict[str, dict] = {}
     if adjudication_path and Path(adjudication_path).exists():
@@ -178,7 +190,7 @@ def merge_adjudications(rows: Iterable[dict], adjudication_path: str | Path | No
         if a:
             r = dict(r)
             r["gold"] = a["gold"]
-            r["source"] = "human"
+            r["source"] = a.get("by") or "human"
             r["sample"] = "random" if a.get("draw") == "random" else r["sample"]
         yield r
 
@@ -249,8 +261,35 @@ GENERIC = re.compile(r"у разі,?\s+коли\s+(?:вона|Велика Па�
 def evidence_label(sentence: str, target: str) -> tuple[str | None, str]:
     """(label, why) read off the sentence, or (None, why) when it cannot be.
 
-    Order matters: an explicit refusal or a quoted procedural rule decides
-    before the direction test, because both contain the departure verb too.
+    Order matters: an explicit refusal or a general remark decides before the
+    direction test, because both contain the departure verb too. The intent
+    "вважає за необхідне відступити" decides NOTHING and the row is dropped —
+    and it is tested BEFORE the procedural citation, because a referral
+    sentence carries the article of the referral rule with it and would
+    otherwise be filed as a quotation of that rule.
+
+    Measured on the 120-row blind draw of 21.09.2026 (two independent readers,
+    agreement 119/120): moving the intent test ahead of the citation took the
+    rule from 102/120 = 85.0% to 102/112 = 91.1%, the eight rows it now drops
+    being exactly the referral sentences it used to call ``norm_quote``.
+
+    Two further changes were tried on the same draw and REVERTED, recorded
+    here so that nobody spends an evening rediscovering them:
+
+    * a direction test for the refusal, mirroring the one the performative
+      has — **80.8%**, worse than doing nothing. It repaired the 7 rows where
+      the target is the ruling that did not depart, and broke 9 where the
+      conclusion departed from is simply named before the verb ("від
+      висновків, викладених у постановах … № X, … Велика Палата не
+      відступила"). Ukrainian fronts that object routinely, so position alone
+      cannot separate subject from object here. What remains true: roughly
+      half of the ``refusal`` rows in this gold name the ruling that refused
+      rather than the conclusion refused from. The fix is grammatical, not
+      positional — or it is the head's job, which is the better argument for
+      training one.
+    * counting ANY later mention of the target instead of the first —
+      **85.0%**, exactly the base: it repaired one truncated sentence and
+      broke one other. No evidence either way, so the simpler rule stays.
     """
     s = sentence or ""
     at = s.find(target)
@@ -267,16 +306,37 @@ def evidence_label(sentence: str, target: str) -> tuple[str | None, str]:
         if at > perf.start():
             return "departure", "ціль стоїть після перформатива «відступив/відступила»"
         return "other", "ціль стоїть перед перформативом: це суд, ЯКИЙ відступив"
-    if NORM_CITE.search(s):
-        return "norm_quote", "цитата процесуальної норми про порядок відступу"
     if INTENT.search(s):
         return None, "намір «вважає за необхідне відступити»: речення не вирішує, хто суб'єкт"
+    if NORM_CITE.search(s):
+        return "norm_quote", "цитата процесуальної норми про порядок відступу"
     return None, "у реченні немає ознаки відступу"
 
 
-def relabel_by_evidence(rows: Iterable[dict]) -> Iterator[dict]:
-    """Keep only rows whose label is visible in the sentence; mark the source."""
+def adjudicated_ids(adjudication_path: str | Path | None) -> frozenset[str]:
+    """Ids a reader has already ruled on, so the relabeller cannot drop them."""
+    if not adjudication_path or not Path(adjudication_path).exists():
+        return frozenset()
+    ids = set()
+    for line in Path(adjudication_path).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            ids.add(json.loads(line)["id"])
+    return frozenset(ids)
+
+
+def relabel_by_evidence(rows: Iterable[dict], keep_ids: Iterable[str] = ()) -> Iterator[dict]:
+    """Keep only rows whose label is visible in the sentence; mark the source.
+
+    ``keep_ids`` survives the drop untouched. A row the rule cannot decide but
+    a reader has is the most valuable row in the file — it is exactly what the
+    random slice is made of — and dropping it before the adjudication is
+    overlaid would throw the reading away.
+    """
+    keep = frozenset(keep_ids)
     for r in rows:
+        if r.get("id") in keep:
+            yield r
+            continue
         st = r.get("state") or {}
         label, why = evidence_label(st.get("sentence", ""), st.get("target_case", ""))
         if not label:

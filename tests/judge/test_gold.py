@@ -258,8 +258,21 @@ class TestDeparturesFromDepGold:
 
         assert len(rows) > 0
         assert rows[0]["gold"] == "departure"
-        assert rows[0]["sample"] == "random"
         assert rows[0]["source"] == "lpd"
+
+    def test_from_dep_gold_is_not_a_random_slice(self, tmp_path):
+        """LPD markup is curated positives: calibrating on it would lie."""
+        gold_file = tmp_path / "dep_gold.json"
+        gold_file.write_text(json.dumps({"positions": [{
+            "lpd_id": "pos1",
+            "evidence": {"quote": "Суд відступив від висновку справи 123/456/20.",
+                         "cause_num": "111/222/20"},
+            "cases": ["123/456/20"],
+        }]}, ensure_ascii=False))
+
+        rows = list(gold_dep.from_dep_gold(gold_file))
+
+        assert rows[0]["sample"] == "enriched"
 
     def test_from_dep_gold_skips_missing_quote(self, tmp_path):
         gold_file = tmp_path / "dep_gold.json"
@@ -323,6 +336,45 @@ class TestDeparturesFromRejectsDump:
         assert len(rows) == 0
 
 
+class TestEvidenceLabelDirection:
+    """Three defects the 120-row blind draw of 21.09.2026 exposed, each with
+    the sentence that exposed it (shortened, public ЄДРСР text)."""
+
+    def test_intent_is_dropped_even_when_the_referral_article_is_quoted(self):
+        s = ("вважає за необхідне відступити від правового висновку, викладеного "
+             "Верховним Судом у справах №№ 927/623/18, 910/18319/16, то справа має "
+             "бути розглянута об`єднаною палатою Касаційного господарського суду у "
+             "складі Верховного Суду згідно з частиною другою статті 302 ГПК України.")
+        label, why = gold_dep.evidence_label(s, "910/18319/16")
+        assert label is None
+        assert "намір" in why
+
+    def test_refusal_is_not_direction_tested(self):
+        """Measured and reverted: a direction test here scored 80.8% against
+        the readers, below the 85.0% of doing nothing, because Ukrainian
+        fronts the object of "не відступила" routinely."""
+        s = ("Від цього висновку Велика Палата Верховного Суду в постанові від "
+             "05 квітня 2023 року у справі № 910/4518/16 не відступила.")
+        assert gold_dep.evidence_label(s, "910/4518/16")[0] == "refusal"
+
+    def test_target_before_the_performative_is_the_departing_court(self):
+        s = ("Судова палата у справі № 806/1368/17 відступила від висновку, "
+             "викладеного у постанові у справі № 825/1276/16.")
+        assert gold_dep.evidence_label(s, "806/1368/17")[0] == "other"
+        assert gold_dep.evidence_label(s, "825/1276/16")[0] == "departure"
+
+
+class TestRelabelKeepsAdjudicatedRows:
+    def test_a_row_a_reader_ruled_on_survives_the_drop(self):
+        rows = [{"id": "row1", "gold": "other", "sample": "enriched", "source": "grammar",
+                 "state": {"sentence": "Колегія вважає за необхідне відступити від висновку "
+                                       "у справі № 123/456/20.", "target_case": "123/456/20"}}]
+
+        assert list(gold_dep.relabel_by_evidence(rows)) == []
+        kept = list(gold_dep.relabel_by_evidence(rows, {"row1"}))
+        assert len(kept) == 1 and kept[0]["id"] == "row1"
+
+
 class TestDeparturesMergeAdjudications:
     """Test merging adjudication overlays."""
 
@@ -342,6 +394,20 @@ class TestDeparturesMergeAdjudications:
         assert len(merged) > 0
         assert merged[0]["gold"] == "departure"
         assert merged[0]["source"] == "human"
+        assert merged[0]["sample"] == "random"
+
+    def test_merge_adjudications_records_who_read_the_row(self, tmp_path):
+        """A verdict that no person produced must not be stamped "human"."""
+        adj_file = tmp_path / "adj.jsonl"
+        adj_file.write_text(json.dumps(
+            {"id": "row1", "gold": "departure", "draw": "random", "by": "model-2of2"},
+            ensure_ascii=False))
+
+        rows = [{"id": "row1", "gold": "other", "sample": "enriched", "source": "grammar"}]
+
+        merged = list(gold_dep.merge_adjudications(rows, adj_file))
+
+        assert merged[0]["source"] == "model-2of2"
         assert merged[0]["sample"] == "random"
 
     def test_merge_adjudications_no_file(self):

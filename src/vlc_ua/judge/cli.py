@@ -73,7 +73,7 @@ def cmd_gold_departures(args) -> None:
     if args.rejects:
         rows += list(gold_dep.from_rejects_dump(args.rejects, limit=args.limit))
     if getattr(args, "evidence", False):
-        rows = list(gold_dep.relabel_by_evidence(rows))
+        rows = list(gold_dep.relabel_by_evidence(rows, gold_dep.adjudicated_ids(args.adjudication)))
     n = gold_dep.write(gold_dep.merge_adjudications(rows, args.adjudication), args.out)
     print(f"{n} rows -> {args.out}")
 
