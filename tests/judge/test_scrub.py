@@ -52,3 +52,35 @@ class TestRow:
         out, n = scrub_row(row)
         assert out["id"] == "x" and out["gold"] == "court" and n >= 1
         assert "Шишов" not in out["state"]["fragment"]
+
+
+class TestGluedPatronymic:
+    """Витяг з RTF склеює слова, і по-батькові лишається без межі слова.
+
+    Заміряно 21.09.2026 на збірці v3: після першої редакції скрубера в
+    10 046 рядках лишалось 2 повні ПІБ, обидва склеєні з наступним словом
+    ("Васильовичазалишити"). Вивантаження таких рядків назовні і є те, чого
+    цей модуль має не допускати.
+    """
+
+    def test_glued_full_name_is_removed(self):
+        out, n = scrub_text("адвоката Моспана Віталія Васильовичазалишити без задоволення")
+        assert "Моспана" not in out and "Віталія" not in out and "Васильович" not in out
+        assert n == 1
+        assert "залишити" in out   # склеєне слово не з'їдається цілком
+
+    def test_glued_surname_name_patronymic(self):
+        out, _ = scrub_text("Кобилецького Вячеслава Вікторовичапро ухвалення рішення")
+        assert "Кобилецького" not in out and "Вікторович" not in out
+        assert "про ухвалення рішення" in out
+
+    def test_name_patronymic_without_surname(self):
+        out, _ = scrub_text("за участю Віталія Васильовича")
+        assert "Віталія" not in out and "Васильовича" not in out
+
+    def test_pseudonyms_and_institutions_survive(self):
+        for keep in ("ОСОБА_1 звернувся до суду",
+                     "Верховний Суд у складі колегії суддів",
+                     "Касаційний господарський суд"):
+            out, n = scrub_text(keep)
+            assert out == keep and n == 0, out
