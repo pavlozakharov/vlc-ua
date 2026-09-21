@@ -215,6 +215,56 @@ class TestHeaderKindVariants:
         assert gold_attr.header_kind("Нормативне врегулювання") == "court"
 
 
+class TestFormsFoundBySweepingTheCorpus:
+    """Seven forms the 21.09 evening sweep of 2 600 rulings turned up. Counting
+    first is the rule here, so each carries the number of lines it appears on;
+    the sweep snapshot is /srv/work/judge/header-lines.json."""
+
+    def test_the_courts_own_assessment(self):
+        assert gold_attr.header_kind("Оцінка Верховного Суду") == "court"              # 105
+
+    def test_assessment_of_the_lower_courts_is_not_the_courts_own(self):
+        assert gold_attr.header_kind(
+            "Оцінка судів першої та апеляційної інстанцій") == "lower"                 # 154
+
+    def test_every_observed_shape_of_the_cassation_summary(self):
+        for line, n in [("Короткий зміст вимог та доводів касаційної скарги", 101),
+                        ("Короткий зміст та обґрунтування вимог касаційної скарги", 58),
+                        ("Короткий зміст та узагальнені доводи касаційної скарги", None),
+                        ("Короткий зміст касаційної скарги", None),
+                        ("Короткий зміст вимог і доводів касаційної скарги", None)]:
+            assert gold_attr.header_kind(line) == "party", line
+
+    def test_the_summary_rule_does_not_reach_into_the_lower_courts_section(self):
+        assert gold_attr.header_kind(
+            "Короткий зміст рішень судів першої та апеляційної інстанцій") == "lower"
+
+    def test_the_response_to_the_cassation_is_still_a_party(self):
+        assert gold_attr.header_kind(
+            "Доводи особи, яка подала відзив на касаційну скаргу") == "party"           # 78
+
+    def test_positions_of_the_participants_in_the_plural(self):
+        assert gold_attr.header_kind("Позиції учасників судового провадження") == "party"  # 120
+
+    def test_one_letter_apart_from_the_recognised_form(self):
+        # «провадження В суді» проти «провадження У суді», «Установлені» проти
+        # «Встановлені» — обидві форми жили в корпусі, лексикон знав по одній.
+        assert gold_attr.header_kind("Провадження в суді касаційної інстанції") == "procedural"  # 76
+        assert gold_attr.header_kind("Провадження у суді касаційної інстанції") == "procedural"
+        assert gold_attr.header_kind(
+            "Установлені судами попередніх інстанцій обставини справи") == "facts"     # 63
+        assert gold_attr.header_kind(
+            "Встановлені судами попередніх інстанцій обставини справи") == "facts"
+
+    def test_the_mixed_header_is_deliberately_left_alone(self):
+        """59 lines run the lower courts' rulings and the facts together under
+        one heading. Either label would be wrong for half the section, so it
+        stays unrecognised and the text before it keeps its own header."""
+        assert gold_attr.header_kind(
+            "Зміст судових рішень і встановлені судами першої та апеляційної "
+            "інстанцій обставини") is None
+
+
 class TestWrappedSentenceIsNotAHeader:
     """Рядок може збігтися з лексиконом, лишаючись початком речення."""
 
@@ -350,12 +400,25 @@ class TestEvidenceLabelDirection:
         assert "намір" in why
 
     def test_refusal_is_not_direction_tested(self):
-        """Measured and reverted: a direction test here scored 80.8% against
-        the readers, below the 85.0% of doing nothing, because Ukrainian
-        fronts the object of "не відступила" routinely."""
+        """The direction test that the performative has was tried here too and
+        REVERTED: 80.8% against the readers, below the 85.0% of doing nothing,
+        because Ukrainian fronts the object of "не відступила" routinely. This
+        pins that behaviour on a sentence where the rule is RIGHT."""
+        s = ("Велика Палата Верховного Суду, розглянувши це питання, від висновку, "
+             "викладеного у постанові від 01 січня 2020 року у справі № 123/456/20, "
+             "не відступила.")
+        assert gold_dep.evidence_label(s, "123/456/20")[0] == "refusal"
+
+    def test_the_refusal_rule_is_known_to_be_wrong_here(self):
+        """Two readers, independently and blind, called this pair "other": the
+        target is the ruling that did not depart, not the conclusion nobody
+        departed from. The rule says "refusal", and no positional fix repairs
+        it without breaking more than it mends, so the defect is pinned rather
+        than hidden. Pooled over 240 read pairs the refusal class is right
+        60.3% of the time — do not train on it unread."""
         s = ("Від цього висновку Велика Палата Верховного Суду в постанові від "
              "05 квітня 2023 року у справі № 910/4518/16 не відступила.")
-        assert gold_dep.evidence_label(s, "910/4518/16")[0] == "refusal"
+        assert gold_dep.evidence_label(s, "910/4518/16")[0] == "refusal"   # читачі: other
 
     def test_target_before_the_performative_is_the_departing_court(self):
         s = ("Судова палата у справі № 806/1368/17 відступила від висновку, "
@@ -461,3 +524,22 @@ class TestScreeningFromSweepClassified:
         nft_rows = [r for r in rows if r["question"] == "needs_fulltext"]
         assert len(nft_rows) > 0
         assert nft_rows[0]["gold"] == "yes"
+
+
+class TestAdjudicationsThatFindNoRow:
+    """Of the 48 rows read on 20.09 only 25 survive into the 21.09 build: the
+    source query's ordering and limit moved and the other 23 ids are no longer
+    produced. The build used to say nothing at all about that."""
+
+    def test_unmatched_ids_are_reported(self, tmp_path):
+        adj = tmp_path / "adj.jsonl"
+        adj.write_text("\n".join([
+            json.dumps({"id": "here", "gold": "departure", "draw": "random"}),
+            json.dumps({"id": "gone", "gold": "refusal", "draw": "random"}),
+        ]), encoding="utf-8")
+        rows = [{"id": "here", "gold": "other", "sample": "enriched", "source": "grammar"}]
+
+        assert gold_dep.unmatched_adjudications(rows, adj) == ["gone"]
+
+    def test_nothing_to_report_without_a_file(self):
+        assert gold_dep.unmatched_adjudications([{"id": "a"}], None) == []
