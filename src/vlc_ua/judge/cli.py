@@ -142,6 +142,19 @@ def cmd_calibrate(args) -> None:
     holdout, which is the honest estimate but not what ``serve`` would load.
     So calibration is its own step, on data the training never saw, and the
     half it is fitted on is not the half it is reported on.
+
+    AND ON THE ARTEFACT THAT SERVES. Quantisation moves the confidences far
+    enough that a temperature fitted on the training-time weights is wrong
+    for the file that answers requests. Same head v6, same holdout, same day:
+
+        torch fp16 on the T4   best T 0.9810 -> ECE 0.0326
+        int8 ONNX on this CPU  best T 1.9341 -> ECE 0.0311
+                               at the torch T 0.9810 -> ECE 0.1098
+
+    Accuracy barely moves (0.8429 against 0.8478) and the two calibrated ECEs
+    agree; what does not survive the quantiser is the temperature. So the run
+    given here comes from the runtime that will serve, and the block records
+    that run's fingerprint so a later reader can tell which one it was.
     """
     from .calibration import Labelled, ece, fit_temperature, split
 
@@ -155,6 +168,13 @@ def cmd_calibrate(args) -> None:
             by_q.setdefault(row["question"], []).append(
                 Labelled(scores=probs[row["id"]], gold=row["gold"], is_probability=True))
 
+    fingerprint = str(d.get("fingerprint") or "")
+    if "_TorchImpl" in fingerprint and (Path(args.model_dir) / "model.onnx").exists():
+        print("WARNING: this run came from the torch runtime, but the model directory holds a "
+              "model.onnx, so serving will use ONNX. A temperature fitted on torch does not "
+              "survive the quantiser (0.0326 -> 0.1098, measured on head v6). Re-run the "
+              "holdout with --runtime onnx and calibrate on that.", file=sys.stderr)
+
     path = Path(args.model_dir) / "head.json"
     meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     temps = dict(meta.get("temperatures", {}))
@@ -167,7 +187,8 @@ def cmd_calibrate(args) -> None:
         t = fit_temperature(dev)
         report[qn] = {"n_dev": len(dev), "n_test": len(test), "temperature": t,
                       "ece_at_this": ece(test, t), "ece_at_stored": ece(test, temps.get(qn, 1.0)),
-                      "ece_uncalibrated": ece(test, 1.0), "gold": str(args.gold)}
+                      "ece_uncalibrated": ece(test, 1.0), "gold": str(args.gold),
+                      "run": str(args.run), "fingerprint": fingerprint}
         temps[qn] = t
     meta["temperatures"] = temps
     meta.setdefault("calibration", {}).update(report)

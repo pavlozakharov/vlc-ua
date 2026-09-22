@@ -487,3 +487,41 @@ class TestCalibrateOnAHoldout:
 
         assert json.loads(head.read_text(encoding="utf-8"))["temperatures"]["q"] == 20.0
         assert "too few" in capsys.readouterr().err
+
+    def test_a_torch_run_against_an_onnx_directory_is_called_out(self, tmp_path, capsys):
+        """Quantisation does not preserve the temperature: head v6 measured
+        0.0326 on torch at T=0.9810 and 0.1098 on int8 at that same T, needing
+        1.9341 of its own. Calibrating on the wrong artefact is silent, so the
+        command says it out loud."""
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = self._fixture(tmp_path, stored=20.0)
+        d = json.loads(run.read_text(encoding="utf-8"))
+        d["fingerprint"] = "/somewhere/head|_TorchImpl|1024"
+        run.write_text(json.dumps(d), encoding="utf-8")
+        (tmp_path / "model.onnx").write_bytes(b"not really a model")
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--write"])
+
+        assert "does not survive the quantiser" in capsys.readouterr().err
+        assert json.loads(head.read_text(encoding="utf-8"))["calibration"]["q"]["fingerprint"] \
+            == "/somewhere/head|_TorchImpl|1024"
+
+    def test_an_onnx_run_passes_without_a_warning(self, tmp_path, capsys):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = self._fixture(tmp_path, stored=20.0)
+        d = json.loads(run.read_text(encoding="utf-8"))
+        d["fingerprint"] = "/somewhere/head|_OnnxImpl|1024"
+        run.write_text(json.dumps(d), encoding="utf-8")
+        (tmp_path / "model.onnx").write_bytes(b"not really a model")
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--write"])
+
+        assert "quantiser" not in capsys.readouterr().err
