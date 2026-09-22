@@ -408,3 +408,82 @@ class TestCLIServe:
         finally:
             import os
             os.unlink(task_file)
+
+
+class TestCalibrateOnAHoldout:
+    """The trainer's own dev split is drawn from the rulings it trained on, so
+    the temperature fitted there does not transfer. Measured 22.09.2026 on the
+    full holdout: head v6 stored 1.9075 gave ECE 0.2552, holdout-fitted 0.9810
+    gave 0.0326, and not calibrating at all gave 0.0317."""
+
+    def _fixture(self, tmp_path, stored):
+        import json
+
+        task = tmp_path / "t.json"
+        task.write_text(json.dumps({"q": {"type": "choice", "instructions": "i",
+                                          "criteria": {"yes": "y", "no": "n"}}}), encoding="utf-8")
+        gold = tmp_path / "g.jsonl"
+        rows, answers = [], {}
+        for i in range(60):
+            truth = "yes" if i % 2 else "no"      # обидва класи, інакше підгонка вироджена
+            hit = i % 4 != 0                      # 75% правильних
+            said = truth if hit else ("no" if truth == "yes" else "yes")
+            rows.append({"id": f"r{i}", "state": "текст", "question": "q",
+                         "gold": truth, "sample": "random"})
+            p = 0.99 if said == "yes" else 0.01   # впевнений незалежно від того, правий чи ні
+            answers[f"r{i}"] = {"type": "choice", "probabilities": {"yes": p, "no": 1 - p}}
+        gold.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+        run = tmp_path / "run.json"
+        run.write_text(json.dumps({"backend": "b", "task_version": "v1", "answers": answers}),
+                       encoding="utf-8")
+        head = tmp_path / "head.json"
+        head.write_text(json.dumps({"temperatures": {"q": stored}}), encoding="utf-8")
+        return task, gold, run, head
+
+    def test_it_replaces_a_temperature_that_does_not_transfer(self, tmp_path, capsys):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = self._fixture(tmp_path, stored=20.0)
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--write"])
+
+        meta = json.loads(head.read_text(encoding="utf-8"))
+        assert meta["temperatures"]["q"] != 20.0
+        block = meta["calibration"]["q"]
+        # Команда не обіцяє, що підігнана температура завжди краща — вона
+        # обіцяє, що температура взята з даних, яких навчання не бачило, і
+        # що поруч лежать усі три ECE, щоб людина бачила, яка з них яка.
+        assert set(block) >= {"n_dev", "n_test", "temperature",
+                              "ece_at_this", "ece_at_stored", "ece_uncalibrated", "gold"}
+        assert block["temperature"] == meta["temperatures"]["q"]
+        assert block["n_dev"] + block["n_test"] == 60
+
+    def test_without_write_the_file_is_untouched(self, tmp_path):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = self._fixture(tmp_path, stored=20.0)
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path)])
+
+        assert json.loads(head.read_text(encoding="utf-8"))["temperatures"]["q"] == 20.0
+
+    def test_a_slice_too_small_to_calibrate_is_left_alone(self, tmp_path, capsys):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = self._fixture(tmp_path, stored=20.0)
+        rows = gold.read_text(encoding="utf-8").splitlines()[:10]
+        gold.write_text("\n".join(rows), encoding="utf-8")
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--write"])
+
+        assert json.loads(head.read_text(encoding="utf-8"))["temperatures"]["q"] == 20.0
+        assert "too few" in capsys.readouterr().err

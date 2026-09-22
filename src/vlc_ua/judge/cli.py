@@ -124,6 +124,59 @@ def cmd_report(args) -> None:
     print(json.dumps(rep, ensure_ascii=False, indent=1))
 
 
+def cmd_calibrate(args) -> None:
+    """Fit the temperature on a HOLDOUT and write it into head.json.
+
+    The trainer fits one on its own dev split, and that number does not
+    transfer: the dev split is drawn from the same rulings the model trained
+    on, so the head is more confident there, a temperature above 1 gets
+    fitted to flatten it, and on unseen rulings that flattening overshoots.
+    Measured 22.09.2026 on the full holdout, ECE of the calibrated head:
+
+        head v5   stored 1.2533 -> 0.0650   holdout-fitted 1.0622 -> 0.0466
+        head v6   stored 1.9075 -> 0.2552   holdout-fitted 0.9810 -> 0.0326
+        (uncalibrated, T=1: 0.0571 and 0.0317)
+
+    Both stored temperatures fail the 0.05 gate the heads were admitted
+    under — the admission ECE was computed with a temperature refitted on the
+    holdout, which is the honest estimate but not what ``serve`` would load.
+    So calibration is its own step, on data the training never saw, and the
+    half it is fitted on is not the half it is reported on.
+    """
+    from .calibration import Labelled, ece, fit_temperature, split
+
+    task = ev.load_task(args.task)
+    gold = ev.load_gold(args.gold)
+    d = json.loads(Path(args.run).read_text(encoding="utf-8"))
+    probs = {k: v["probabilities"] for k, v in d["answers"].items()}
+    by_q: dict[str, list[Labelled]] = {}
+    for row in gold:
+        if row["id"] in probs and row.get("sample", "random") == "random":
+            by_q.setdefault(row["question"], []).append(
+                Labelled(scores=probs[row["id"]], gold=row["gold"], is_probability=True))
+
+    path = Path(args.model_dir) / "head.json"
+    meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    temps = dict(meta.get("temperatures", {}))
+    report = {}
+    for qn, items in by_q.items():
+        if len(items) < 20:
+            print(f"{qn}: {len(items)} rows is too few to calibrate on, left alone", file=sys.stderr)
+            continue
+        dev, test = split(items)
+        t = fit_temperature(dev)
+        report[qn] = {"n_dev": len(dev), "n_test": len(test), "temperature": t,
+                      "ece_at_this": ece(test, t), "ece_at_stored": ece(test, temps.get(qn, 1.0)),
+                      "ece_uncalibrated": ece(test, 1.0), "gold": str(args.gold)}
+        temps[qn] = t
+    meta["temperatures"] = temps
+    meta.setdefault("calibration", {}).update(report)
+    if args.write:
+        path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"head.json updated: {path}")
+    print(json.dumps(report, ensure_ascii=False, indent=1))
+
+
 def cmd_serve(args) -> None:
     from .serve import serve
     backend = make_backend(args)
@@ -195,6 +248,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--api-key-env", default="LLM_API_KEY")
     p.set_defaults(fn=lambda a: __import__("vlc_ua.judge.probe", fromlist=["probe"]).main(
         ["--base-url", a.base_url, "--model", a.model, "--api-key-env", a.api_key_env]))
+
+    p = sub.add_parser("calibrate",
+                       help="fit the temperature on a holdout run and write it into head.json")
+    p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)
+    p.add_argument("--model-dir", required=True)
+    p.add_argument("--write", action="store_true", help="actually write head.json")
+    p.set_defaults(fn=cmd_calibrate)
 
     p = sub.add_parser("serve"); _backend_args(p)
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8009)
