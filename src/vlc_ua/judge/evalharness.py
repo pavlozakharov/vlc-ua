@@ -80,6 +80,13 @@ class RunResult:
     answers: dict[str, Answer] = field(default_factory=dict)   # item id -> answer
     seconds: dict[str, float] = field(default_factory=dict)
     failures: dict[str, str] = field(default_factory=dict)
+    # Scoring backends only. ``scores`` are the raw per-option logits, and
+    # ``temperatures`` what the backend applied to turn them into
+    # ``answers``. A run that keeps only the probabilities has the
+    # temperature baked in with nothing to say which one — and every run
+    # before 23.09.2026 was that kind (see cli.cmd_calibrate).
+    scores: dict[str, dict[str, float]] = field(default_factory=dict)
+    temperatures: dict[str, float] = field(default_factory=dict)
 
 
 def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str, Any]],
@@ -105,11 +112,35 @@ def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str
     forward pass across the cores, and competing sessions only thrash. The
     per-request timings stay honest either way — each row is timed around its
     own call, not around the batch.
+
+    A SCORING backend (one with ``raw_scores``: the trained head, keyword
+    rules) is cached as raw scores, and its temperature is applied on the
+    way out. Until 23.09.2026 the cache and the run file kept the tempered
+    probabilities, and three things went wrong with that at once:
+
+    * the key carries the fingerprint (head directory, runtime, window) but
+      not the temperature, so after ``calibrate --write`` a rerun was served
+      the probabilities of the OLD temperature under the new head.json;
+    * the run file did not say which temperature was baked in, and
+      ``calibrate`` read the probabilities as if none were. What it fitted was
+      a factor on top of the run's temperature, and it wrote that factor into
+      head.json as if it were the temperature itself;
+    * reports printed "ECE at the stored temperature" by applying it a second
+      time, and "uncalibrated" was the ECE at the run's temperature.
+
+    Entries of a scoring backend that hold no scores are therefore misses:
+    nothing in them says which temperature made them. ``accept_legacy_cache``
+    still serves them, as it serves unfingerprinted ones, and such rows come
+    out without scores, so ``calibrate`` and ``threshold`` will not take them
+    without being told the temperature.
     """
     res = RunResult(backend=getattr(backend, "name", backend.__class__.__name__),
                     task_version=task_version)
     fingerprint = str(getattr(backend, "fingerprint", "") or "")
     res.fingerprint = fingerprint
+    scoring = callable(getattr(backend, "raw_scores", None)) and callable(getattr(backend, "answer", None))
+    if scoring:
+        res.temperatures = dict(getattr(backend, "temperatures", {}) or {})
     cache = Path(cache_dir) if cache_dir else None
     if cache:
         cache.mkdir(parents=True, exist_ok=True)
@@ -126,24 +157,38 @@ def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str
         return cpath
 
     def ask_one(row):
-        """-> (id, answer|None, seconds, failure|None). Pure per row, so the
-        only shared state is the dicts the caller fills in one thread."""
+        """-> (id, answer|None, seconds, failure|None, raw scores|None). Pure
+        per row, so the only shared state is the dicts the caller fills in one
+        thread."""
         qn = row["question"]
         q = task[qn]
         cpath = cache_path(row)
         if cpath and cpath.exists():
             d = json.loads(cpath.read_text(encoding="utf-8"))
-            return row["id"], Answer.from_probs(q, d["probabilities"]), d.get("seconds", 0.0), None
+            if not scoring:
+                return row["id"], Answer.from_probs(q, d["probabilities"]), d.get("seconds", 0.0), None, None
+            if "scores" in d:
+                return row["id"], backend.answer(qn, q, d["scores"]), d.get("seconds", 0.0), None, d["scores"]
+            if accept_legacy_cache:
+                return row["id"], Answer.from_probs(q, d["probabilities"]), d.get("seconds", 0.0), None, None
+            # a scoring backend's entry without scores: re-score (see above)
         t0 = time.time()
+        raw = None
         try:
-            ans = backend.ask(row["state"], {qn: q})[qn]
+            if scoring:
+                raw = backend.raw_scores(row["state"], {qn: q})[qn]
+                ans = backend.answer(qn, q, raw)
+            else:
+                ans = backend.ask(row["state"], {qn: q})[qn]
         except Exception as exc:  # provider quota, network, malformed: a separate class
-            return row["id"], None, time.time() - t0, f"{type(exc).__name__}: {exc}"[:300]
+            return row["id"], None, time.time() - t0, f"{type(exc).__name__}: {exc}"[:300], None
         dt = time.time() - t0
         if cpath:
-            cpath.write_text(json.dumps({"probabilities": ans.probabilities, "seconds": dt},
-                                        ensure_ascii=False), encoding="utf-8")
-        return row["id"], ans, dt, None
+            entry = {"probabilities": ans.probabilities, "seconds": dt}
+            if raw is not None:
+                entry["scores"] = raw
+            cpath.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        return row["id"], ans, dt, None, raw
 
     if concurrency > 1:
         from concurrent.futures import ThreadPoolExecutor
@@ -152,34 +197,88 @@ def run(backend: Judge, task: Mapping[str, Question], gold: Iterable[Mapping[str
     else:
         out = [ask_one(row) for row in rows]
 
-    for rid, ans, dt, failure in out:
+    for rid, ans, dt, failure, raw in out:
         if failure is not None:
             res.failures[rid] = failure
             continue
         res.answers[rid] = ans
         res.seconds[rid] = dt
+        if raw is not None:
+            res.scores[rid] = dict(raw)
     return res
 
 
-def labelled(result: RunResult, gold: Iterable[Mapping[str, Any]], sample: str | None = None) -> list[Labelled]:
-    out = []
+def logits_for(result: RunResult, rid: str,
+               run_temperatures: Mapping[str, float] | None = None,
+               question: str | None = None) -> dict[str, float] | None:
+    """Raw per-option logits for one row, or None when they cannot be known.
+
+    Recorded scores are taken as they are. Otherwise the stored probabilities
+    are un-tempered: softmax(z / T) has log p_k = z_k / T - log Z, so
+    T * log p_k recovers z_k up to one constant per row, which softmax does
+    not see. T comes only from ``run_temperatures`` — what the caller says was
+    in force when the run was made. Not from the run's own ``temperatures``:
+    in a run that records them, a row without scores is one served from a
+    legacy cache entry, made at some earlier temperature nobody wrote down.
+    Without a declared T the answer is None, because guessing T = 1 is
+    exactly the mistake this function exists to stop.
+    """
+    if rid in result.scores:
+        return dict(result.scores[rid])
+    a = result.answers.get(rid)
+    if a is None or not run_temperatures or question not in run_temperatures:
+        return None
+    import math
+    t = run_temperatures[question]
+    return {k: t * math.log(max(v, 1e-300)) for k, v in a.probabilities.items()}
+
+
+def labelled_with_basis(result: RunResult, gold: Iterable[Mapping[str, Any]],
+                        sample: str | None = None,
+                        run_temperatures: Mapping[str, float] | None = None
+                        ) -> tuple[list[Labelled], str]:
+    """Items plus what their scores ARE.
+
+    ``"logits"``: raw logits for every row, so a temperature fitted on them is
+    the temperature, and ECE at T = 1 is the uncalibrated one.
+    ``"probabilities"``: at least one row has no logits, so all rows go in as
+    the stored probabilities; a temperature fitted on them is a FACTOR on top
+    of whatever the run applied, and "T = 1" means "as the run left them".
+    One basis per list: mixing the two would fit one number to two scales.
+    """
+    rows = []
     for row in gold:
         if sample and row.get("sample", "random") != sample:
             continue
         a = result.answers.get(row["id"])
         if a is None:
             continue
-        out.append(Labelled(scores=a.probabilities, gold=row["gold"], is_probability=True))
-    return out
+        rows.append((row, a, logits_for(result, row["id"], run_temperatures, row.get("question"))))
+    if rows and all(z is not None for _, _, z in rows):
+        return [Labelled(scores=z, gold=row["gold"]) for row, _, z in rows], "logits"
+    return [Labelled(scores=a.probabilities, gold=row["gold"], is_probability=True)
+            for row, a, _ in rows], "probabilities"
+
+
+def labelled(result: RunResult, gold: Iterable[Mapping[str, Any]], sample: str | None = None,
+             run_temperatures: Mapping[str, float] | None = None) -> list[Labelled]:
+    return labelled_with_basis(result, gold, sample, run_temperatures)[0]
 
 
 def report(result: RunResult, gold: list[Mapping[str, Any]], target_precision: float = 0.95,
-           baseline: RunResult | None = None) -> dict[str, Any]:
+           baseline: RunResult | None = None,
+           run_temperatures: Mapping[str, float] | None = None) -> dict[str, Any]:
     """Build the report dict. Temperature is fitted on a dev half of the
     random slice and applied to the test half; the enriched slice is reported
-    at the same temperature but only for sensitivity and confusion."""
-    rand = labelled(result, gold, "random")
-    enr = labelled(result, gold, "enriched")
+    at the same temperature but only for sensitivity and confusion.
+
+    ``temperature_basis`` says what the fitted temperature is: on
+    ``"logits"`` it is the temperature, on ``"probabilities"`` it is a factor
+    on top of the one the run applied (``run_temperatures``), and
+    ``ece_uncalibrated`` is then the ECE as the run left it, not at T = 1.
+    Calibrated ECE, accuracy and thresholds are the same on either basis."""
+    rand, basis = labelled_with_basis(result, gold, "random", run_temperatures)
+    enr, enr_basis = labelled_with_basis(result, gold, "enriched", run_temperatures)
     dev, test = split(rand) if len(rand) >= 20 else ([], rand)
     temp = fit_temperature(dev) if dev else 1.0
     out: dict[str, Any] = {
@@ -187,7 +286,8 @@ def report(result: RunResult, gold: list[Mapping[str, Any]], target_precision: f
         "n_random": len(rand), "n_enriched": len(enr), "n_failures": len(result.failures),
         "failures_sample": dict(list(result.failures.items())[:5]),
         "latency_s": _latency(result.seconds.values()),
-        "temperature": temp,
+        "temperature": temp, "temperature_basis": basis,
+        "run_temperatures": dict(run_temperatures or result.temperatures),
     }
     if test:
         out["random"] = {
@@ -206,9 +306,11 @@ def report(result: RunResult, gold: list[Mapping[str, Any]], target_precision: f
             out["random"]["threshold_heldout"] = apply_threshold(
                 test, tau, target_precision, "random", temp).as_dict()
     if enr:
+        # a temperature fitted on one basis means nothing on the other
+        t_enr = temp if enr_basis == basis else 1.0
         out["enriched"] = {
-            "sensitivity_accuracy": accuracy(enr, temp), "ece": ece(enr, temp),
-            "confusion": confusion(enr, temp),
+            "sensitivity_accuracy": accuracy(enr, t_enr), "ece": ece(enr, t_enr),
+            "confusion": confusion(enr, t_enr), "temperature_basis": enr_basis,
             "note": "enriched slice: sensitivity only; thresholds fitted here would lie",
         }
     if baseline is not None:

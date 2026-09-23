@@ -83,9 +83,32 @@ class CrossEncoderHead:
         temps = temperatures if temperatures is not None else self.meta.get("temperatures", {})
         # Two heads answer under the same backend name; the cache must not mix
         # their answers, so the key carries which head, which runtime, which
-        # window.
-        fp = f"{self.model_dir}|{type(self._impl).__name__}|{self.max_length}"
+        # window — and which weights: a head re-exported or re-quantised into
+        # the same directory is a different backend under the same path.
+        # The temperature is NOT in the key, and need not be: the harness
+        # caches raw logits and applies it on the way out.
+        fp = f"{self.model_dir}|{type(self._impl).__name__}|{self.max_length}|{weights_identity(self.model_dir)}"
         return ScoringJudge(self.score, name=name, temperatures=temps, fingerprint=fp)
+
+
+def weights_identity(model_dir: str) -> str:
+    """Cheap identity of the weight file: size plus a hash of its first and
+    last megabyte. Hashing all 570 MB of an int8 head on every load would cost
+    a second or two for nothing; a re-export changes both ends and the size."""
+    import hashlib
+
+    for name in ("model.onnx", "model.safetensors", "pytorch_model.bin"):
+        p = Path(model_dir) / name
+        if p.exists():
+            size = p.stat().st_size
+            h = hashlib.sha256()
+            with p.open("rb") as f:
+                h.update(f.read(1 << 20))
+                if size > (2 << 20):
+                    f.seek(-(1 << 20), 2)
+                    h.update(f.read(1 << 20))
+            return f"{name}:{size}:{h.hexdigest()[:16]}"
+    return "no-weights"
 
 
 def onnx_threads() -> int:

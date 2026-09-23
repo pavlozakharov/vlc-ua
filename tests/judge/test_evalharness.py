@@ -340,3 +340,82 @@ class TestCacheKeyCarriesTheBackendFingerprint:
         reused = ev.run(fingerprinted, task, gold, cache_dir=tmp_path, accept_legacy_cache=True)
 
         assert reused.answers["r1"].probabilities["yes"] > 0.5
+
+
+class TestTheCacheHoldsLogitsNotATemperature:
+    """Until 23.09.2026 the cache and the run file held tempered probabilities
+    under a key without the temperature: after ``calibrate --write`` a rerun
+    was served the OLD temperature, and the run could not say which one it
+    carried. Measured: the int8 run of head v6 carried T 0.9810 and was
+    calibrated as if it carried none."""
+
+    def _setup(self, temperature):
+        from vlc_ua.judge.backend import ScoringJudge
+        from vlc_ua.judge.types import question_from_dict
+
+        task = {"q": question_from_dict({"type": "choice", "instructions": "i",
+                                         "criteria": {"yes": "y", "no": "n"}})}
+        gold = [{"id": "r1", "state": "текст", "question": "q", "gold": "yes"}]
+        judge = ScoringJudge(lambda s, q, o: 2.0 if o == "yes" else 0.0, name="head",
+                             temperatures={"q": temperature}, fingerprint="head-v1")
+        return task, gold, judge
+
+    def test_a_changed_temperature_applies_to_cached_rows(self, tmp_path):
+        import math
+
+        task, gold, cold = self._setup(1.0)
+        ev.run(cold, task, gold, cache_dir=tmp_path)
+        _, _, hot = self._setup(2.0)
+        hot.score_fn = lambda s, q, o: (_ for _ in ()).throw(AssertionError("must come from cache"))
+
+        res = ev.run(hot, task, gold, cache_dir=tmp_path)
+
+        assert res.answers["r1"].probabilities["yes"] == pytest.approx(1 / (1 + math.exp(-1.0)))
+
+    def test_the_run_records_logits_and_the_temperature_it_applied(self, tmp_path):
+        task, gold, judge = self._setup(0.5)
+
+        res = ev.run(judge, task, gold, cache_dir=tmp_path)
+
+        assert res.scores["r1"] == {"yes": 2.0, "no": 0.0}
+        assert res.temperatures == {"q": 0.5}
+        assert ev.logits_for(res, "r1", None, "q") == {"yes": 2.0, "no": 0.0}
+
+    def test_an_entry_without_logits_is_a_miss_for_a_scoring_backend(self, tmp_path):
+        import json
+
+        task, gold, judge = self._setup(1.0)
+        key = ev._item_key("head", "v1", gold[0], "head-v1")
+        (tmp_path / f"{key}.json").write_text(
+            json.dumps({"probabilities": {"yes": 0.01, "no": 0.99}, "seconds": 1.0}), encoding="utf-8")
+
+        res = ev.run(judge, task, gold, cache_dir=tmp_path)
+
+        assert res.answers["r1"].probabilities["yes"] > 0.5
+        assert "r1" in res.scores
+
+    def test_under_the_legacy_hatch_such_rows_have_no_logits(self, tmp_path):
+        import json
+
+        task, gold, judge = self._setup(1.0)
+        key = ev._item_key("head", "v1", gold[0], "head-v1")
+        (tmp_path / f"{key}.json").write_text(
+            json.dumps({"probabilities": {"yes": 0.3, "no": 0.7}, "seconds": 1.0}), encoding="utf-8")
+
+        res = ev.run(judge, task, gold, cache_dir=tmp_path, accept_legacy_cache=True)
+
+        assert "r1" not in res.scores
+        # the run's own temperature is NOT this row's: it was made at some other one
+        assert ev.logits_for(res, "r1", None, "q") is None
+        assert ev.logits_for(res, "r1", {"q": 2.0}, "q") is not None
+
+    def test_a_basis_is_one_basis(self, tmp_path):
+        task, gold, judge = self._setup(1.0)
+        res = ev.run(judge, task, gold + [{"id": "r2", "state": "інше", "question": "q", "gold": "no"}],
+                     cache_dir=tmp_path)
+        del res.scores["r2"]
+
+        items, basis = ev.labelled_with_basis(res, gold + [{"id": "r2", "question": "q", "gold": "no"}])
+
+        assert basis == "probabilities"
+        assert all(it.is_probability for it in items)

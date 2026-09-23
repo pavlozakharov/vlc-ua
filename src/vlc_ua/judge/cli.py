@@ -94,6 +94,11 @@ def cmd_run(args) -> None:
                "fingerprint": res.fingerprint,
                "answers": {k: a.as_dict() for k, a in res.answers.items()},
                "seconds": res.seconds, "failures": res.failures}
+    if res.scores or res.temperatures:
+        # raw logits and the temperature that made ``answers`` out of them:
+        # without these a run cannot be recalibrated (see cmd_calibrate)
+        payload["temperatures"] = res.temperatures
+        payload["scores"] = res.scores
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     print(f"{len(res.answers)} answers, {len(res.failures)} failures -> {args.out}")
@@ -102,7 +107,9 @@ def cmd_run(args) -> None:
 def _load_run(path: str, task) -> ev.RunResult:
     d = json.loads(Path(path).read_text(encoding="utf-8"))
     res = ev.RunResult(backend=d["backend"], task_version=d["task_version"],
-                       seconds=d.get("seconds", {}), failures=d.get("failures", {}))
+                       fingerprint=str(d.get("fingerprint") or ""),
+                       seconds=d.get("seconds", {}), failures=d.get("failures", {}),
+                       scores=d.get("scores", {}), temperatures=d.get("temperatures", {}))
     for rid, a in d["answers"].items():
         qn = rid_question.get(rid)
         q = task[qn] if qn else None
@@ -120,82 +127,213 @@ def cmd_report(args) -> None:
     rid_question.update({g["id"]: g["question"] for g in gold})
     res = _load_run(args.run, task)
     base = _load_run(args.baseline, task) if args.baseline else None
-    rep = ev.report(res, gold, target_precision=args.target_precision, baseline=base)
+    rep = ev.report(res, gold, target_precision=args.target_precision, baseline=base,
+                    run_temperatures=_run_temperatures(args, task))
     print(json.dumps(rep, ensure_ascii=False, indent=1))
 
 
+def _run_temperatures(args, task) -> dict[str, float] | None:
+    """``--run-temperature`` values: ``1.2533`` for every question in the task,
+    or ``attribution=1.2533`` for one."""
+    vals = getattr(args, "run_temperature", None) or []
+    if not vals:
+        return None
+    out: dict[str, float] = {}
+    for v in vals:
+        if "=" in v:
+            qn, t = v.split("=", 1)
+            out[qn.strip()] = float(t)
+        else:
+            for qn in task:
+                out[qn] = float(v)
+    return out
+
+
+def _random_items(args, task):
+    """-> (run, {question: (items, basis)}) over the random slice. Refuses a
+    question whose rows cannot all be turned into logits."""
+    gold = ev.load_gold(args.gold)
+    rid_question.update({g["id"]: g["question"] for g in gold})
+    res = _load_run(args.run, task)
+    declared = _run_temperatures(args, task)
+    rows_by_q: dict[str, list] = {}
+    for row in gold:
+        rows_by_q.setdefault(row["question"], []).append(row)
+    out = {}
+    for qn, rows in rows_by_q.items():
+        items, basis = ev.labelled_with_basis(res, rows, "random", declared)
+        ids = [r["id"] for r in rows if r.get("sample", "random") == "random" and r["id"] in res.answers]
+        if basis == "logits":
+            how = ("logits recorded in the run" if all(i in res.scores for i in ids) else
+                   f"probabilities of the run un-tempered at the declared run temperature "
+                   f"{declared[qn]}")
+        else:
+            how = None
+        out[qn] = (items, how)
+    return res, declared, out
+
+
+_NO_LOGITS = ("{qn}: the run holds probabilities with a temperature already applied, and does "
+              "not record which. A temperature fitted on them is a factor on top of that one, "
+              "not a temperature — until 23.09.2026 this command wrote exactly that factor into "
+              "head.json. Re-run with the current code (it records raw logits), or pass "
+              "--run-temperature with the value head.json held when the run was made.")
+
+
 def cmd_calibrate(args) -> None:
-    """Fit the temperature on a HOLDOUT and write it into head.json.
+    """Fit the temperature on a HOLDOUT, on raw logits, and write it into head.json.
 
-    The trainer fits one on its own dev split, and that number does not
-    transfer: the dev split is drawn from the same rulings the model trained
-    on, so the head is more confident there, a temperature above 1 gets
-    fitted to flatten it, and on unseen rulings that flattening overshoots.
-    Measured 22.09.2026 on the full holdout, ECE of the calibrated head:
+    WHAT THIS COMMAND GOT WRONG UNTIL 23.09.2026, AND WHAT STANDS. It read the
+    run's probabilities as if no temperature had been applied. But a run is
+    made through ``CrossEncoderHead.judge()``, which applies head.json's
+    temperature, and the Kaggle kernel runs the holdout right after the
+    trainer has written one. So the fitted number was a FACTOR on top of the
+    run's temperature, and that factor went into head.json as the
+    temperature. Recomputed on the same splits from logits recovered as
+    T_run * log p (evalharness.logits_for); the run temperatures were checked
+    by re-scoring rows with the int8 head, implied T equal to 4 digits:
 
-        head v5   stored 1.2533 -> 0.0650   holdout-fitted 1.0622 -> 0.0466
-        head v6   stored 1.9075 -> 0.2552   holdout-fitted 0.9810 -> 0.0326
-        (uncalibrated, T=1: 0.0571 and 0.0317)
+                         T_run    optimum   ECE@opt  ECE@trainer  ECE@T=1
+        v5 torch / T4    1.2533   1.3083    0.0385   0.0537       0.0922
+        v5 int8 / CPU    1.2533   1.3312    0.0466   0.0571       0.1011
+        v6 torch / T4    1.9075   1.8711    0.0326   0.0317       0.1034
+        v6 int8 / CPU    0.9810   1.8974    0.0311   0.0284       0.1078
 
-    Both stored temperatures fail the 0.05 gate the heads were admitted
-    under — the admission ECE was computed with a temperature refitted on the
-    holdout, which is the honest estimate but not what ``serve`` would load.
-    So calibration is its own step, on data the training never saw, and the
-    half it is fitted on is not the half it is reported on.
+    The claims of 22.09 that this refutes, and why they looked true:
 
-    AND ON THE ARTEFACT THAT SERVES. Quantisation moves the confidences far
-    enough that a temperature fitted on the training-time weights is wrong
-    for the file that answers requests. Same head v6, same holdout, same day:
+    * "head v6's stored temperature 1.9075 gives ECE 0.2552, it does not
+      transfer from the trainer's dev split" — 0.2552 is the ECE at
+      1.9075 applied twice (3.64). At 1.9075 the ECE is 0.0317 on torch and
+      0.0284 on int8: the trainer's temperature transfers for v6.
+    * "quantisation does not preserve the temperature: torch 0.9810, int8
+      1.9341; at the torch T the int8 ECE is 0.1098" — the two numbers were
+      factors on top of DIFFERENT run temperatures (1.9075 and 0.9810). The
+      optima are 1.8711 and 1.8974, 1.4 % apart; 0.1098 is the int8 ECE at
+      0.962. Raw int8 is not "twice as overconfident" either: at T = 1 the
+      two runtimes give 0.1034 and 0.1078.
+    * "head v5's stored 1.2533 gives 0.0650" — that is 1.2533 applied twice.
+      At 1.2533 the ECE is 0.0537 / 0.0571: v5 does miss the 0.05 gate with
+      its trainer's temperature, but narrowly, and 1.3312 fixes it.
 
-        torch fp16 on the T4   best T 0.9810 -> ECE 0.0326
-        int8 ONNX on this CPU  best T 1.9341 -> ECE 0.0311
-                               at the torch T 0.9810 -> ECE 0.1098
+    What stands: calibrating on a holdout, on the artefact that serves, is
+    still the procedure (it caught v5's narrow miss), and the admission
+    numbers were right, because a fitted factor on top of T_run gives the
+    same calibrated probabilities as the absolute optimum — only the number
+    written down was not the one serve applies. head v6 served 1.9341 where
+    the optimum is 1.8974 (int8 ECE 0.0299, harmless by luck: the two
+    errors nearly cancelled). Applying this command's old output for v5 would
+    have written 1.0622 and served ECE 0.0911.
 
-    Accuracy barely moves (0.8429 against 0.8478) and the two calibrated ECEs
-    agree; what does not survive the quantiser is the temperature. So the run
-    given here comes from the runtime that will serve, and the block records
-    that run's fingerprint so a later reader can tell which one it was.
+    So: the temperature is fitted on raw logits only. A run from the current
+    harness records them; an older run needs ``--run-temperature`` (the
+    value head.json held when the run was made), and without it the command
+    refuses. The block records which basis it used.
     """
-    from .calibration import Labelled, ece, fit_temperature, split
+    from .calibration import ece, fit_temperature, split
 
     task = ev.load_task(args.task)
-    gold = ev.load_gold(args.gold)
-    d = json.loads(Path(args.run).read_text(encoding="utf-8"))
-    probs = {k: v["probabilities"] for k, v in d["answers"].items()}
-    by_q: dict[str, list[Labelled]] = {}
-    for row in gold:
-        if row["id"] in probs and row.get("sample", "random") == "random":
-            by_q.setdefault(row["question"], []).append(
-                Labelled(scores=probs[row["id"]], gold=row["gold"], is_probability=True))
-
-    fingerprint = str(d.get("fingerprint") or "")
+    res, declared, by_q = _random_items(args, task)
+    fingerprint = res.fingerprint
     if "_TorchImpl" in fingerprint and (Path(args.model_dir) / "model.onnx").exists():
-        print("WARNING: this run came from the torch runtime, but the model directory holds a "
-              "model.onnx, so serving will use ONNX. A temperature fitted on torch does not "
-              "survive the quantiser (0.0326 -> 0.1098, measured on head v6). Re-run the "
-              "holdout with --runtime onnx and calibrate on that.", file=sys.stderr)
+        print("NOTE: this run came from the torch runtime, but the model directory holds a "
+              "model.onnx, so serving will use ONNX. On heads v5 and v6 the two optimal "
+              "temperatures differed by 1.4-1.7 % (v6: 1.8711 torch, 1.8974 int8), so the "
+              "number is usable, but it is not the served artefact's.", file=sys.stderr)
 
     path = Path(args.model_dir) / "head.json"
     meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     temps = dict(meta.get("temperatures", {}))
     report = {}
-    for qn, items in by_q.items():
+    refused = False
+    for qn, (items, how) in by_q.items():
+        if how is None:
+            print(_NO_LOGITS.format(qn=qn), file=sys.stderr)
+            refused = True
+            continue
         if len(items) < 20:
             print(f"{qn}: {len(items)} rows is too few to calibrate on, left alone", file=sys.stderr)
             continue
         dev, test = split(items)
         t = fit_temperature(dev)
+        trainer_t = meta.get("dev_metrics", {}).get(qn, {}).get("temperature")
         report[qn] = {"n_dev": len(dev), "n_test": len(test), "temperature": t,
                       "ece_at_this": ece(test, t), "ece_at_stored": ece(test, temps.get(qn, 1.0)),
-                      "ece_uncalibrated": ece(test, 1.0), "gold": str(args.gold),
-                      "run": str(args.run), "fingerprint": fingerprint}
+                      "ece_uncalibrated": ece(test, 1.0),
+                      "ece_at_trainer": ece(test, trainer_t) if trainer_t else None,
+                      "temperature_before": temps.get(qn), "basis": how,
+                      "run_temperature": (declared or {}).get(qn, res.temperatures.get(qn)),
+                      "gold": str(args.gold), "run": str(args.run), "fingerprint": fingerprint}
+        # a threshold only holds at the temperature it was fitted at
+        tc = meta.get("threshold_calibration", {}).get(qn)
+        if tc and abs(float(tc.get("temperature", 0.0)) - t) > 1e-9:
+            meta.get("thresholds", {}).pop(qn, None)
+            tc["stale"] = f"fitted at T {tc.get('temperature')}; the temperature is now {t}"
+            print(f"{qn}: the threshold in head.json was fitted at T {tc.get('temperature')} and "
+                  f"is removed; run `vlc-judge threshold` again", file=sys.stderr)
         temps[qn] = t
     meta["temperatures"] = temps
     meta.setdefault("calibration", {}).update(report)
-    if args.write:
+    if args.write and report:
         path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"head.json updated: {path}")
     print(json.dumps(report, ensure_ascii=False, indent=1))
+    if refused:
+        raise SystemExit(2)
+
+
+def cmd_threshold(args) -> None:
+    """Pick the serving confidence threshold from a bootstrap band and write
+    it into head.json next to the temperature it was fitted at.
+
+    One split is a lottery here (head v6: coverage 0.1826 on one split, 0.5007
+    in the median of 200), see calibration.threshold_band. The threshold is
+    fitted at the temperature head.json holds NOW — the one serve applies —
+    so calibrate first; if the temperature later changes, ``calibrate``
+    removes the threshold rather than leave one fitted at another T.
+    """
+    from .calibration import threshold_band
+
+    task = ev.load_task(args.task)
+    res, declared, by_q = _random_items(args, task)
+    path = Path(args.model_dir) / "head.json"
+    meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    temps = meta.get("temperatures", {})
+    cal = meta.get("calibration", {})
+    out = {}
+    refused = False
+    for qn, (items, how) in by_q.items():
+        if how is None:
+            print(_NO_LOGITS.format(qn=qn), file=sys.stderr)
+            refused = True
+            continue
+        if qn not in temps:
+            print(f"{qn}: head.json holds no temperature for it; a threshold is a confidence at "
+                  f"the temperature that serves, so run `vlc-judge calibrate` first",
+                  file=sys.stderr)
+            refused = True
+            continue
+        if len(items) < 50:
+            print(f"{qn}: {len(items)} rows is too few for a threshold, left alone", file=sys.stderr)
+            continue
+        fp_cal = str(cal.get(qn, {}).get("fingerprint") or "")
+        if fp_cal and res.fingerprint and fp_cal != res.fingerprint:
+            print(f"{qn}: WARNING the temperature was calibrated on a run of {fp_cal!r}, this "
+                  f"run is {res.fingerprint!r}", file=sys.stderr)
+        band = threshold_band(items, args.target_precision, float(temps[qn]),
+                              resamples=args.resamples, seed=args.seed)
+        band.update({"policy": args.policy, "basis": how, "gold": str(args.gold),
+                     "run": str(args.run), "fingerprint": res.fingerprint,
+                     "sample": "random"})
+        out[qn] = band
+    if args.write and out:
+        meta.setdefault("thresholds", {}).update(
+            {qn: b["policies"][args.policy]["threshold"] for qn, b in out.items()})
+        meta.setdefault("threshold_calibration", {}).update(out)
+        path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"head.json updated: {path}")
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    if refused:
+        raise SystemExit(2)
 
 
 def cmd_serve(args) -> None:
@@ -255,9 +393,13 @@ def main(argv: list[str] | None = None) -> None:
                         "cannot be told apart from stale ones")
     p.set_defaults(fn=cmd_run)
 
+    run_t_help = ("for a run made before 23.09.2026, which stored tempered probabilities and "
+                  "not the logits: the temperature head.json held when the run was made "
+                  "(a number, or QUESTION=number)")
     p = sub.add_parser("report")
     p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)
     p.add_argument("--baseline"); p.add_argument("--target-precision", type=float, default=0.95)
+    p.add_argument("--run-temperature", action="append", help=run_t_help)
     p.set_defaults(fn=cmd_report)
 
     p = sub.add_parser("scrub-gold", help="replace personal names in a gold file before upload")
@@ -275,7 +417,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)
     p.add_argument("--model-dir", required=True)
     p.add_argument("--write", action="store_true", help="actually write head.json")
+    p.add_argument("--run-temperature", action="append", help=run_t_help)
     p.set_defaults(fn=cmd_calibrate)
+
+    p = sub.add_parser("threshold",
+                       help="pick the serving confidence threshold from a bootstrap band "
+                            "and write it into head.json")
+    p.add_argument("run"); p.add_argument("--task", required=True); p.add_argument("--gold", required=True)
+    p.add_argument("--model-dir", required=True)
+    p.add_argument("--target-precision", type=float, default=0.95)
+    p.add_argument("--policy", choices=["guarded", "median"], default="guarded",
+                   help="guarded: precision holds in 95%% of resamples; median: the median "
+                        "single-split threshold, a little under target on average")
+    p.add_argument("--resamples", type=int, default=200)
+    p.add_argument("--seed", type=int, default=20260923)
+    p.add_argument("--write", action="store_true", help="actually write head.json")
+    p.add_argument("--run-temperature", action="append", help=run_t_help)
+    p.set_defaults(fn=cmd_threshold)
 
     p = sub.add_parser("serve"); _backend_args(p)
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8009)

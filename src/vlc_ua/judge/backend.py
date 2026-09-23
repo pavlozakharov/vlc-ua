@@ -63,12 +63,18 @@ class ScoringJudge:
         return {qname: {opt: float(self.score_fn(state, q, opt)) for opt in q.options}
                 for qname, q in questions.items()}
 
+    def answer(self, qname: str, question: Question, scores: Mapping[str, float]) -> Answer:
+        """Raw per-option scores -> the answer this judge gives NOW.
+
+        Split out so the harness can cache the scores and apply the
+        temperature on the way out: a cached probability carries whatever
+        temperature was in force when it was written, and nothing in it says
+        which (see ``evalharness.run``)."""
+        return Answer.from_probs(question, softmax(scores, self.temperatures.get(qname, 1.0)))
+
     def ask(self, state: State, questions: Mapping[str, Question]) -> dict[str, Answer]:
-        out: dict[str, Answer] = {}
-        for qname, scores in self.raw_scores(state, questions).items():
-            t = self.temperatures.get(qname, 1.0)
-            out[qname] = Answer.from_probs(questions[qname], softmax(scores, t))
-        return out
+        return {qname: self.answer(qname, questions[qname], scores)
+                for qname, scores in self.raw_scores(state, questions).items()}
 
 
 class ConstantJudge:

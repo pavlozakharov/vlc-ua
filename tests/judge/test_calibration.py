@@ -360,3 +360,60 @@ class TestHeldOutThreshold:
 
         with pytest.raises(ValueError):
             apply_threshold(self._items([(0.9, True)]), 0.5, 0.95, "whatever")
+
+
+class TestThresholdBand:
+    """One split is a lottery near the target (head v6: coverage 0.1826 on one
+    split, 0.5007 in the median of 200)."""
+
+    def _items(self, n=600, seed=1):
+        import random
+
+        from vlc_ua.judge.calibration import Labelled
+
+        rnd = random.Random(seed)
+        out = []
+        for _ in range(n):
+            m = rnd.uniform(0.0, 8.0)
+            right = rnd.random() < 1 / (1 + 2.718 ** (-(m - 1.0)))
+            gold = "a" if right else "b"
+            out.append(Labelled(scores={"a": m, "b": 0.0}, gold=gold))
+        return out
+
+    def test_the_guarded_threshold_keeps_the_promise_across_resamples(self):
+        from vlc_ua.judge.calibration import threshold_band
+
+        band = threshold_band(self._items(), 0.9, resamples=100)
+        g = band["policies"]["guarded"]
+
+        assert g["share_of_resamples_meeting_target"] >= 0.94
+        assert g["precision_band"][0] >= 0.9
+
+    def test_guarded_is_never_looser_than_median(self):
+        from vlc_ua.judge.calibration import threshold_band
+
+        band = threshold_band(self._items(), 0.9, resamples=100)
+
+        assert band["policies"]["guarded"]["threshold"] >= band["policies"]["median"]["threshold"]
+
+    def test_it_is_deterministic_for_a_seed(self):
+        from vlc_ua.judge.calibration import threshold_band
+
+        items = self._items()
+        assert threshold_band(items, 0.9, resamples=30, seed=5) == threshold_band(items, 0.9, resamples=30, seed=5)
+
+    def test_the_temperature_moves_the_threshold_not_the_queue(self):
+        """A confidence threshold only means something at the temperature it
+        was fitted at: the same rows at another T give another number."""
+        from vlc_ua.judge.calibration import threshold_band
+
+        items = self._items()
+        a = threshold_band(items, 0.9, temperature=1.0, resamples=50)
+        b = threshold_band(items, 0.9, temperature=2.0, resamples=50)
+
+        assert a["policies"]["guarded"]["threshold"] != b["policies"]["guarded"]["threshold"]
+
+    def test_empty_is_empty(self):
+        from vlc_ua.judge.calibration import threshold_band
+
+        assert threshold_band([], 0.9)["n"] == 0

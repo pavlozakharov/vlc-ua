@@ -217,6 +217,145 @@ def confusion(items: Sequence[Labelled], temperature: float = 1.0) -> dict[str, 
     return out
 
 
+def _quantiles(xs: Sequence[float], qs: Sequence[float] = (0.05, 0.5, 0.95)) -> list[float]:
+    s = sorted(xs)
+    if not s:
+        return [0.0 for _ in qs]
+    return [s[min(len(s) - 1, int(q * (len(s) - 1) + 0.5))] for q in qs]
+
+
+def threshold_band(items: Sequence[Labelled], target_precision: float, temperature: float = 1.0,
+                   resamples: int = 200, seed: int = 20260923,
+                   lower_quantile: float = 0.05) -> dict:
+    """A serving threshold taken from a bootstrap band, not from one split.
+
+    ``fit_threshold`` returns the lowest confidence at which the accepted
+    answers still reach the target ON THE SET IT IS GIVEN. Near the target
+    the precision curve is flat, so which crossing it lands on is decided by
+    a handful of rows: head v6 on its holdout gave coverage 0.1826 on one
+    split and 0.5007 in the median of 200 (22.09.2026). Serving one of those
+    numbers is serving a coin toss.
+
+    Here every candidate threshold is scored on ``resamples`` bootstrap
+    resamples of ``items`` (drawn with replacement, same size), at the
+    temperature that will serve. Two policies come out:
+
+    * ``guarded`` — the lowest threshold whose precision stays at or above
+      the target in all but ``lower_quantile`` of the resamples. This is the
+      one that keeps the promise: "precision 0.95" holds in 95 % of
+      resamples, not in the one that happened to be drawn.
+    * ``median`` — the median of the thresholds ``fit_threshold`` picks on
+      each resample. Closer to what earlier reports quoted, and it keeps the
+      optimism of max-coverage selection: expect precision a little under
+      the target.
+
+    ``single_fit_out_of_bag`` is the old procedure measured honestly: fit on
+    a resample, apply to the rows that resample left out. Its band is the
+    lottery a single split buys.
+
+    Rows are taken as given — use the random slice. Enriched rows make any
+    threshold lie, whichever policy picks it.
+    """
+    import random
+
+    rows = []
+    for it in items:
+        pr = _probs(it, temperature)
+        top = max(pr, key=pr.__getitem__)
+        rows.append((confidence_of_probs(pr), top == it.gold))
+    n = len(rows)
+    out: dict = {"n": n, "temperature": temperature, "target_precision": target_precision,
+                 "resamples": resamples, "seed": seed, "lower_quantile": lower_quantile}
+    if n == 0:
+        return out
+    order = sorted(range(n), key=lambda i: -rows[i][0])
+    # cut positions: accept order[:j+1]; only where the next confidence is
+    # strictly lower, so tied rows are never split between accepted and not
+    cuts = [j for j in range(n) if j == n - 1 or rows[order[j + 1]][0] < rows[order[j]][0]]
+    conf_at = [rows[order[j]][0] for j in cuts]
+
+    def curve(weights: Sequence[int]) -> tuple[list[float], list[float]]:
+        """precision and coverage at every cut, for rows weighted by counts"""
+        prec, cov = [], []
+        w = hit = 0
+        k = 0
+        total = sum(weights)
+        for j in range(n):
+            i = order[j]
+            w += weights[i]
+            hit += weights[i] if rows[i][1] else 0
+            if k < len(cuts) and cuts[k] == j:
+                prec.append(hit / w if w else float("nan"))
+                cov.append(w / total if total else 0.0)
+                k += 1
+        return prec, cov
+
+    def fit_on(prec: Sequence[float]) -> float:
+        best = None
+        for k, p in enumerate(prec):
+            if p == p and p >= target_precision:
+                best = k
+        return conf_at[best] if best is not None else 1.0
+
+    def apply_on(weights: Sequence[int], tau: float) -> tuple[float, float]:
+        acc = ok = 0
+        total = sum(weights)
+        for i, (c, h) in enumerate(rows):
+            if weights[i] and c >= tau:
+                acc += weights[i]
+                ok += weights[i] if h else 0
+        return (ok / acc if acc else float("nan")), (acc / total if total else 0.0)
+
+    rnd = random.Random(seed)
+    prec_by_b, cov_by_b, fitted, oob = [], [], [], []
+    for _ in range(resamples):
+        weights = [0] * n
+        for _ in range(n):
+            weights[rnd.randrange(n)] += 1
+        prec, cov = curve(weights)
+        prec_by_b.append(prec)
+        cov_by_b.append(cov)
+        tau = fit_on(prec)
+        fitted.append(tau)
+        left_out = [0 if w else 1 for w in weights]
+        oob.append(apply_on(left_out, tau))
+
+    def band_at(tau: float) -> dict:
+        # on every resample, tau accepts exactly the rows up to the last cut
+        # whose confidence is >= tau
+        k = max((k for k, c in enumerate(conf_at) if c >= tau), default=None)
+        if k is None:
+            ps, cs = [float("nan")] * resamples, [0.0] * resamples
+        else:
+            ps = [prec_by_b[b][k] for b in range(resamples)]
+            cs = [cov_by_b[b][k] for b in range(resamples)]
+        full_p, full_c = apply_on([1] * n, tau)
+        clean = [p for p in ps if p == p]
+        return {"threshold": tau, "precision_band": _quantiles(clean),
+                "coverage_band": _quantiles(cs),
+                "precision_full": full_p, "coverage_full": full_c,
+                "share_of_resamples_meeting_target": (sum(1 for p in clean if p >= target_precision)
+                                                      / len(clean)) if clean else 0.0}
+
+    # guarded: lowest threshold whose lower-quantile precision meets the target
+    guarded_k = None
+    for k in range(len(cuts)):
+        col = [prec_by_b[b][k] for b in range(resamples)]
+        col = [p for p in col if p == p]
+        if col and _quantiles(col, (lower_quantile,))[0] >= target_precision:
+            guarded_k = k
+    tau_guarded = conf_at[guarded_k] if guarded_k is not None else 1.0
+    tau_median = _quantiles(fitted, (0.5,))[0]
+
+    out["fitted_threshold_band"] = _quantiles(fitted)
+    out["single_fit_out_of_bag"] = {
+        "precision_band": _quantiles([p for p, _ in oob if p == p]),
+        "coverage_band": _quantiles([c for _, c in oob]),
+    }
+    out["policies"] = {"guarded": band_at(tau_guarded), "median": band_at(tau_median)}
+    return out
+
+
 def split(items: Sequence[Labelled], dev_share: float = 0.5, seed: int = 20260920) -> tuple[list[Labelled], list[Labelled]]:
     """Deterministic dev/test split; fit temperature on dev, report on test."""
     import random

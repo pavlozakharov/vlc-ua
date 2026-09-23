@@ -411,44 +411,55 @@ class TestCLIServe:
 
 
 class TestCalibrateOnAHoldout:
-    """The trainer's own dev split is drawn from the rulings it trained on, so
-    the temperature fitted there does not transfer. Measured 22.09.2026 on the
-    full holdout: head v6 stored 1.9075 gave ECE 0.2552, holdout-fitted 0.9810
-    gave 0.0326, and not calibrating at all gave 0.0317."""
+    """Calibration is fitted on a holdout the training never saw, on RAW
+    logits. Until 23.09.2026 it was fitted on the run's probabilities, which
+    already carried head.json's temperature, and the factor it found went
+    into head.json as the temperature: head v6 served 1.9341 where the
+    optimum is 1.8974, and v5 would have been written 1.0622 (served ECE
+    0.0911) instead of 1.3312."""
 
-    def _fixture(self, tmp_path, stored):
+    def _fixture(self, tmp_path, stored, run_temperature=1.0, record_logits=True, n=60):
         import json
+        import math
 
         task = tmp_path / "t.json"
         task.write_text(json.dumps({"q": {"type": "choice", "instructions": "i",
                                           "criteria": {"yes": "y", "no": "n"}}}), encoding="utf-8")
         gold = tmp_path / "g.jsonl"
-        rows, answers = [], {}
-        for i in range(60):
+        rows, answers, scores = [], {}, {}
+        for i in range(n):
             truth = "yes" if i % 2 else "no"      # обидва класи, інакше підгонка вироджена
             hit = i % 4 != 0                      # 75% правильних
             said = truth if hit else ("no" if truth == "yes" else "yes")
             rows.append({"id": f"r{i}", "state": "текст", "question": "q",
                          "gold": truth, "sample": "random"})
-            p = 0.99 if said == "yes" else 0.01   # впевнений незалежно від того, правий чи ні
-            answers[f"r{i}"] = {"type": "choice", "probabilities": {"yes": p, "no": 1 - p}}
+            z = {"yes": 4.6, "no": 0.0} if said == "yes" else {"yes": 0.0, "no": 4.6}
+            e = {k: math.exp(v / run_temperature) for k, v in z.items()}
+            answers[f"r{i}"] = {"type": "choice",
+                                "probabilities": {k: v / sum(e.values()) for k, v in e.items()}}
+            scores[f"r{i}"] = z
         gold.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
         run = tmp_path / "run.json"
-        run.write_text(json.dumps({"backend": "b", "task_version": "v1", "answers": answers}),
-                       encoding="utf-8")
+        d = {"backend": "b", "task_version": "v1", "answers": answers}
+        if record_logits:
+            d.update({"scores": scores, "temperatures": {"q": run_temperature}})
+        run.write_text(json.dumps(d), encoding="utf-8")
         head = tmp_path / "head.json"
         head.write_text(json.dumps({"temperatures": {"q": stored}}), encoding="utf-8")
         return task, gold, run, head
 
+    def _calibrate(self, tmp_path, task, gold, run, *extra):
+        from vlc_ua.judge.cli import main
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), *extra])
+
     def test_it_replaces_a_temperature_that_does_not_transfer(self, tmp_path, capsys):
         import json
 
-        from vlc_ua.judge.cli import main
-
         task, gold, run, head = self._fixture(tmp_path, stored=20.0)
 
-        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
-              "--model-dir", str(tmp_path), "--write"])
+        self._calibrate(tmp_path, task, gold, run, "--write")
 
         meta = json.loads(head.read_text(encoding="utf-8"))
         assert meta["temperatures"]["q"] != 20.0
@@ -456,46 +467,81 @@ class TestCalibrateOnAHoldout:
         # Команда не обіцяє, що підігнана температура завжди краща — вона
         # обіцяє, що температура взята з даних, яких навчання не бачило, і
         # що поруч лежать усі три ECE, щоб людина бачила, яка з них яка.
-        assert set(block) >= {"n_dev", "n_test", "temperature",
-                              "ece_at_this", "ece_at_stored", "ece_uncalibrated", "gold"}
+        assert set(block) >= {"n_dev", "n_test", "temperature", "ece_at_this", "ece_at_stored",
+                              "ece_uncalibrated", "gold", "basis", "run_temperature"}
         assert block["temperature"] == meta["temperatures"]["q"]
         assert block["n_dev"] + block["n_test"] == 60
+        assert block["basis"] == "logits recorded in the run"
+
+    def test_the_temperature_of_the_run_is_not_written_down_twice(self, tmp_path):
+        """The defect itself: the same logits, run once at T=1 and once at
+        T=0.5, must calibrate to the same temperature."""
+        import json
+
+        (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+        fa = self._fixture(tmp_path / "a", stored=1.0, run_temperature=1.0)
+        fb = self._fixture(tmp_path / "b", stored=0.5, run_temperature=0.5)
+        self._calibrate(tmp_path / "a", *fa[:3], "--write")
+        self._calibrate(tmp_path / "b", *fb[:3], "--write")
+
+        ta = json.loads(fa[3].read_text(encoding="utf-8"))["temperatures"]["q"]
+        tb = json.loads(fb[3].read_text(encoding="utf-8"))["temperatures"]["q"]
+        assert ta == pytest.approx(tb, rel=1e-6)
+        assert ta > 1.0          # 75 % right at 99 % confidence: must flatten
+
+    def test_a_run_without_logits_is_refused(self, tmp_path, capsys):
+        import json
+
+        task, gold, run, head = self._fixture(tmp_path, stored=0.5, run_temperature=0.5,
+                                              record_logits=False)
+
+        with pytest.raises(SystemExit) as exc:
+            self._calibrate(tmp_path, task, gold, run, "--write")
+
+        assert exc.value.code == 2
+        assert "--run-temperature" in capsys.readouterr().err
+        assert json.loads(head.read_text(encoding="utf-8"))["temperatures"]["q"] == 0.5
+
+    def test_a_declared_run_temperature_recovers_the_logits(self, tmp_path):
+        import json
+
+        (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+        fa = self._fixture(tmp_path / "a", stored=1.0)
+        fb = self._fixture(tmp_path / "b", stored=0.5, run_temperature=0.5, record_logits=False)
+        self._calibrate(tmp_path / "a", *fa[:3], "--write")
+        self._calibrate(tmp_path / "b", *fb[:3], "--write", "--run-temperature", "q=0.5")
+
+        ta = json.loads(fa[3].read_text(encoding="utf-8"))["temperatures"]["q"]
+        mb = json.loads(fb[3].read_text(encoding="utf-8"))
+        assert mb["temperatures"]["q"] == pytest.approx(ta, rel=1e-6)
+        assert "declared run temperature 0.5" in mb["calibration"]["q"]["basis"]
 
     def test_without_write_the_file_is_untouched(self, tmp_path):
         import json
 
-        from vlc_ua.judge.cli import main
-
         task, gold, run, head = self._fixture(tmp_path, stored=20.0)
 
-        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
-              "--model-dir", str(tmp_path)])
+        self._calibrate(tmp_path, task, gold, run)
 
         assert json.loads(head.read_text(encoding="utf-8"))["temperatures"]["q"] == 20.0
 
     def test_a_slice_too_small_to_calibrate_is_left_alone(self, tmp_path, capsys):
         import json
 
-        from vlc_ua.judge.cli import main
-
         task, gold, run, head = self._fixture(tmp_path, stored=20.0)
         rows = gold.read_text(encoding="utf-8").splitlines()[:10]
         gold.write_text("\n".join(rows), encoding="utf-8")
 
-        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
-              "--model-dir", str(tmp_path), "--write"])
+        self._calibrate(tmp_path, task, gold, run, "--write")
 
         assert json.loads(head.read_text(encoding="utf-8"))["temperatures"]["q"] == 20.0
         assert "too few" in capsys.readouterr().err
 
     def test_a_torch_run_against_an_onnx_directory_is_called_out(self, tmp_path, capsys):
-        """Quantisation does not preserve the temperature: head v6 measured
-        0.0326 on torch at T=0.9810 and 0.1098 on int8 at that same T, needing
-        1.9341 of its own. Calibrating on the wrong artefact is silent, so the
-        command says it out loud."""
+        """Not a blocker any more — the optima of heads v5 and v6 differed by
+        1.4-1.7 % between torch and int8 — but the number written is not the
+        served artefact's, and the command says so."""
         import json
-
-        from vlc_ua.judge.cli import main
 
         task, gold, run, head = self._fixture(tmp_path, stored=20.0)
         d = json.loads(run.read_text(encoding="utf-8"))
@@ -503,17 +549,14 @@ class TestCalibrateOnAHoldout:
         run.write_text(json.dumps(d), encoding="utf-8")
         (tmp_path / "model.onnx").write_bytes(b"not really a model")
 
-        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
-              "--model-dir", str(tmp_path), "--write"])
+        self._calibrate(tmp_path, task, gold, run, "--write")
 
-        assert "does not survive the quantiser" in capsys.readouterr().err
+        assert "not the served artefact" in capsys.readouterr().err
         assert json.loads(head.read_text(encoding="utf-8"))["calibration"]["q"]["fingerprint"] \
             == "/somewhere/head|_TorchImpl|1024"
 
-    def test_an_onnx_run_passes_without_a_warning(self, tmp_path, capsys):
+    def test_an_onnx_run_passes_without_a_note(self, tmp_path, capsys):
         import json
-
-        from vlc_ua.judge.cli import main
 
         task, gold, run, head = self._fixture(tmp_path, stored=20.0)
         d = json.loads(run.read_text(encoding="utf-8"))
@@ -521,7 +564,75 @@ class TestCalibrateOnAHoldout:
         run.write_text(json.dumps(d), encoding="utf-8")
         (tmp_path / "model.onnx").write_bytes(b"not really a model")
 
-        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
-              "--model-dir", str(tmp_path), "--write"])
+        self._calibrate(tmp_path, task, gold, run, "--write")
 
-        assert "quantiser" not in capsys.readouterr().err
+        assert "served artefact" not in capsys.readouterr().err
+
+    def test_a_new_temperature_removes_a_threshold_fitted_at_the_old_one(self, tmp_path, capsys):
+        import json
+
+        task, gold, run, head = self._fixture(tmp_path, stored=20.0, n=120)
+        meta = json.loads(head.read_text(encoding="utf-8"))
+        meta["thresholds"] = {"q": 0.9}
+        meta["threshold_calibration"] = {"q": {"temperature": 20.0}}
+        head.write_text(json.dumps(meta), encoding="utf-8")
+
+        self._calibrate(tmp_path, task, gold, run, "--write")
+
+        meta = json.loads(head.read_text(encoding="utf-8"))
+        assert "q" not in meta["thresholds"]
+        assert "stale" in meta["threshold_calibration"]["q"]
+
+
+class TestThresholdCommand:
+    def test_it_writes_the_threshold_next_to_the_temperature(self, tmp_path):
+        import json
+        import math
+
+        from vlc_ua.judge.cli import main
+
+        task = tmp_path / "t.json"
+        task.write_text(json.dumps({"q": {"type": "choice", "instructions": "i",
+                                          "criteria": {"yes": "y", "no": "n"}}}), encoding="utf-8")
+        rows, scores, answers = [], {}, {}
+        for i in range(400):
+            margin = (i % 40) / 4.0                 # впевненість від 0 до ~10 логітів
+            truth = "yes" if i % 2 else "no"
+            right = margin > 3 or i % 3 != 0        # слабкі відповіді частіше хибні
+            said = truth if right else ("no" if truth == "yes" else "yes")
+            z = {said: margin, ("no" if said == "yes" else "yes"): 0.0}
+            rows.append({"id": f"r{i}", "state": "т", "question": "q", "gold": truth, "sample": "random"})
+            scores[f"r{i}"] = z
+            e = {k: math.exp(v) for k, v in z.items()}
+            answers[f"r{i}"] = {"type": "choice", "probabilities": {k: v / sum(e.values()) for k, v in e.items()}}
+        gold = tmp_path / "g.jsonl"
+        gold.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        run = tmp_path / "run.json"
+        run.write_text(json.dumps({"backend": "b", "task_version": "v1", "answers": answers,
+                                   "scores": scores, "temperatures": {"q": 1.0}}), encoding="utf-8")
+        head = tmp_path / "head.json"
+        head.write_text(json.dumps({"temperatures": {"q": 1.0}}), encoding="utf-8")
+
+        main(["threshold", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--resamples", "50", "--write"])
+
+        meta = json.loads(head.read_text(encoding="utf-8"))
+        block = meta["threshold_calibration"]["q"]
+        assert meta["thresholds"]["q"] == block["policies"]["guarded"]["threshold"]
+        assert block["temperature"] == 1.0
+        assert block["policies"]["guarded"]["share_of_resamples_meeting_target"] >= 0.9
+
+    def test_without_a_calibrated_temperature_it_refuses(self, tmp_path, capsys):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        f = TestCalibrateOnAHoldout()._fixture(tmp_path, stored=1.0)
+        task, gold, run, head = f
+        head.write_text(json.dumps({}), encoding="utf-8")
+
+        with pytest.raises(SystemExit):
+            main(["threshold", str(run), "--task", str(task), "--gold", str(gold),
+                  "--model-dir", str(tmp_path)])
+
+        assert "calibrate" in capsys.readouterr().err

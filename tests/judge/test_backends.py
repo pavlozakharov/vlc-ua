@@ -480,3 +480,22 @@ class TestOnnxThreadBudgetSurvivesBadInput:
 
         assert ce.onnx_threads() == 6
         assert "negative" in capsys.readouterr().err
+
+
+class TestWeightsIdentity:
+    """A head re-quantised into the same directory is another backend: the
+    cache key must see it (audit of 23.09.2026)."""
+
+    def test_a_rewritten_weight_file_changes_the_identity(self, tmp_path):
+        from vlc_ua.judge.backends.crossencoder import weights_identity
+
+        (tmp_path / "model.onnx").write_bytes(b"a" * 3_000_000)
+        before = weights_identity(str(tmp_path))
+        (tmp_path / "model.onnx").write_bytes(b"a" * 2_999_999 + b"b")
+
+        assert weights_identity(str(tmp_path)) != before
+
+    def test_no_weights_is_said_out_loud(self, tmp_path):
+        from vlc_ua.judge.backends.crossencoder import weights_identity
+
+        assert weights_identity(str(tmp_path)) == "no-weights"
