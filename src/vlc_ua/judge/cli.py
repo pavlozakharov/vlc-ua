@@ -261,7 +261,11 @@ def cmd_calibrate(args) -> None:
                       "ece_uncalibrated": ece(test, 1.0),
                       "ece_at_trainer": ece(test, trainer_t) if trainer_t else None,
                       "temperature_before": temps.get(qn), "basis": how,
-                      "run_temperature": (declared or {}).get(qn, res.temperatures.get(qn)),
+                      # a run from the current harness records what it applied, and
+                      # none recorded there means 1.0; an older run only knows what
+                      # the caller declared
+                      "run_temperature": ((declared or {}).get(qn)
+                                          or (res.temperatures.get(qn, 1.0) if res.scores else None)),
                       "gold": str(args.gold), "run": str(args.run), "fingerprint": fingerprint}
         # a threshold only holds at the temperature it was fitted at
         tc = meta.get("threshold_calibration", {}).get(qn)
@@ -275,7 +279,9 @@ def cmd_calibrate(args) -> None:
     meta.setdefault("calibration", {}).update(report)
     if args.write and report:
         path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"head.json updated: {path}")
+        # stderr: stdout carries the JSON block, and a status line in front of
+        # it made `threshold --write > file` unparseable (23.09.2026)
+        print(f"head.json updated: {path}", file=sys.stderr)
     print(json.dumps(report, ensure_ascii=False, indent=1))
     if refused:
         raise SystemExit(2)
@@ -330,7 +336,9 @@ def cmd_threshold(args) -> None:
             {qn: b["policies"][args.policy]["threshold"] for qn, b in out.items()})
         meta.setdefault("threshold_calibration", {}).update(out)
         path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"head.json updated: {path}")
+        # stderr: stdout carries the JSON block, and a status line in front of
+        # it made `threshold --write > file` unparseable (23.09.2026)
+        print(f"head.json updated: {path}", file=sys.stderr)
     print(json.dumps(out, ensure_ascii=False, indent=1))
     if refused:
         raise SystemExit(2)

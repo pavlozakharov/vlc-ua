@@ -636,3 +636,32 @@ class TestThresholdCommand:
                   "--model-dir", str(tmp_path)])
 
         assert "calibrate" in capsys.readouterr().err
+
+
+class TestCommandOutputIsParseable:
+    def test_threshold_write_keeps_stdout_pure_json(self, tmp_path, capsys):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = TestCalibrateOnAHoldout()._fixture(tmp_path, stored=1.0, n=120)
+        main(["threshold", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--resamples", "20", "--write"])
+
+        out = capsys.readouterr()
+        assert json.loads(out.out)["q"]["temperature"] == 1.0
+        assert "head.json updated" in out.err
+
+    def test_a_current_run_at_the_default_temperature_says_so(self, tmp_path, capsys):
+        import json
+
+        from vlc_ua.judge.cli import main
+
+        task, gold, run, head = TestCalibrateOnAHoldout()._fixture(tmp_path, stored=1.0)
+        d = json.loads(run.read_text(encoding="utf-8")); d["temperatures"] = {}
+        run.write_text(json.dumps(d), encoding="utf-8")
+
+        main(["calibrate", str(run), "--task", str(task), "--gold", str(gold),
+              "--model-dir", str(tmp_path), "--write"])
+
+        assert json.loads(head.read_text(encoding="utf-8"))["calibration"]["q"]["run_temperature"] == 1.0
