@@ -48,13 +48,18 @@ def answers_from_wire(questions: Mapping[str, Question], wire: Mapping[str, Any]
 
 @dataclass
 class TypeSafeJudge:
-    """Direct TypeSafe API. ``TYPESAFE_API_KEY`` or ``api_key``."""
+    """Direct TypeSafe API. ``TYPESAFE_API_KEY`` or ``api_key``.
+
+    No zero data retention on this endpoint: TypeSafe offers ZDR to enterprise
+    customers by agreement only and documents no request header for it
+    (docs.typesafe.ai/models, checked 2026-09-24). The ``X-Zero-Data-Retention``
+    header sent until then is xAI's response header and had no effect; it is gone,
+    and so is the flag that pretended to switch it. Scrub before sending."""
 
     model: str = "jev-1.13.0"   # pin a version; the alias drifts
     api_key: str | None = None
     base_url: str = "https://api.typesafe.ai/v1/systemone"
     timeout: float = 30.0
-    zero_data_retention: bool = True
     name: str = "typesafe"
 
     @property
@@ -69,8 +74,6 @@ class TypeSafeJudge:
         body: dict[str, Any] = {"model": self.model, "state": state,
                                 "questions": {qn: question_to_dict(q) for qn, q in questions.items()}}
         headers = {"Authorization": f"Bearer {key}"}
-        if self.zero_data_retention:
-            headers["X-Zero-Data-Retention"] = "true"   # verify header name against docs
         resp = _post(self.base_url, body, headers, self.timeout)
         return answers_from_wire(questions, resp.get("answers") or {})
 
